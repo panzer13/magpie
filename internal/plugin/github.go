@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/url"
 	"os"
 	"path"
@@ -25,15 +26,21 @@ const Topic = "magpie-plugin"
 
 // Tagged is a repository tagged with Topic.
 type Tagged struct {
-	Spec        string    `json:"spec"`  // what Install adds: its npm name when npm has it from this repository, else github:owner/repo
-	Repo        string    `json:"repo"`  // owner/repo
-	URL         string    `json:"url"`   // its page on GitHub
-	Owner       string    `json:"owner"` // its owner's login
-	OwnerAvatar string    `json:"ownerAvatar,omitempty"`
-	Description string    `json:"description,omitempty"`
-	Stars       int       `json:"stars"`
-	License     string    `json:"license,omitempty"` // SPDX id
-	Pushed      time.Time `json:"pushed"`
+	Spec        string `json:"spec"`  // what Install adds: its npm name when npm has it from this repository, else github:owner/repo
+	Repo        string `json:"repo"`  // owner/repo
+	URL         string `json:"url"`   // its page on GitHub
+	Owner       string `json:"owner"` // its owner's login
+	OwnerAvatar string `json:"ownerAvatar,omitempty"`
+	Description string `json:"description,omitempty"`
+	Stars       int    `json:"stars"`
+	// License is its SPDX id as GitHub reads its LICENSE file, else as
+	// its package.json says (PkgLicense): a LICENSE GitHub can't match to
+	// one (NOASSERTION: MIT's text with a line of credit added) or none at
+	// all left the card with no licence, while npm shows package.json's
+	// (plugins#468)
+	License    string    `json:"license,omitempty"`
+	PkgLicense string    `json:"pkgLicense,omitempty"`
+	Pushed     time.Time `json:"pushed"`
 	// from its package.json on the default branch: what bun will install
 	// it as, its version, and whether it is gateway middleware or an agent
 	Package string `json:"package,omitempty"`
@@ -57,14 +64,18 @@ var (
 // kept while its last push stays the same, so asking again costs no more.
 const taggedTTL = 10 * time.Minute
 
-// taggedWait is how long the page waits for GitHub; taggedEach bounds a
-// repository's reads (package.json, npm, its entry file), which go on past
+// taggedSearch bounds each page of GitHub's search: from mainland China
+// a page straight from api.github.com takes about 30s (MYCF711, #3923),
+// and with the search under taggedWait the list was empty there.
+// taggedWait is how long the page then waits for the repositories' reads;
+// taggedEach bounds a repository's reads (package.json, npm, its entry file), which go on past
 // that wait and are kept for the next ask; taggedAtOnce repositories are
 // read at once; and a list that left a repository out for want of an
 // answer is asked again after taggedRetry. Through a proxy far away each
 // read takes a few hundred milliseconds (larchsis on X: a list cut short
 // at the wait was kept ten minutes).
 var (
+	taggedSearch = 60 * time.Second
 	taggedWait   = 8 * time.Second
 	taggedEach   = 20 * time.Second
 	taggedAtOnce = 12
@@ -78,6 +89,10 @@ var (
 	taggedMu sync.Mutex
 	taggedL  []Tagged
 	taggedAt time.Time
+	// taggedWhy is why taggedL isn't GitHub's whole answer: the search
+	// failed (taggedL is what it said before), or repositories it named
+	// couldn't be read. nil when it is.
+	taggedWhy error
 	// owner/repo@pushed → what its package.json and npm made of it, nil
 	// when it was left out
 	readMu   sync.Mutex
@@ -96,6 +111,24 @@ func taggedOnDisk() []Tagged {
 	return l
 }
 
+// ErrNoAnswer is GitHub not answering a read before the page stopped
+// waiting for it.
+var ErrNoAnswer = errors.New("no answer")
+
+// TaggedMissing is the error TaggedRepos gives when GitHub's search
+// answered but repositories it named couldn't be read: Missing of them
+// aren't in the list, for Why.
+type TaggedMissing struct {
+	Missing int
+	Why     error
+}
+
+func (e *TaggedMissing) Error() string {
+	return fmt.Sprintf("%d repositories tagged %s couldn't be read from GitHub: %v", e.Missing, Topic, e.Why)
+}
+
+func (e *TaggedMissing) Unwrap() error { return e.Why }
+
 // TaggedRepos are the repositories tagged with Topic, the most starred
 // first: GitHub asked at most every ten minutes (its search lets 10 a minute
 // through without a token), else what it said last, kept on disk. Archived
@@ -104,22 +137,29 @@ func taggedOnDisk() []Tagged {
 // couldn't install either. A repository whose package.json didn't come in
 // time is as the list had it last, and the list is asked again in
 // taggedRetry. MAGPIE_PLUGIN_MARKET=off keeps to none.
-func TaggedRepos(ctx context.Context) []Tagged {
+//
+// The error says the list isn't GitHub's whole answer, and why: the search
+// failed (the list is what GitHub said before, empty when it never
+// answered), or, a *TaggedMissing, repositories it named couldn't be read.
+// An empty list is never a failed read passed off as there being none
+// (till on Discord: GitHub unreachable from their desktop, and the
+// section just wasn't there).
+func TaggedRepos(ctx context.Context) ([]Tagged, error) {
 	taggedMu.Lock()
 	defer taggedMu.Unlock()
 	if taggedL != nil && time.Since(taggedAt) < taggedTTL {
-		return taggedL
+		return taggedL, taggedWhy
 	}
 	if os.Getenv("MAGPIE_PLUGIN_MARKET") == "off" {
-		return []Tagged{}
+		return []Tagged{}, nil
 	}
 	// a magpie started again within the ten minutes: what GitHub said then,
 	// without the wait of asking (a package.json read for each)
 	if taggedL == nil {
 		if fi, err := os.Stat(taggedCache()); err == nil && time.Since(fi.ModTime()) < taggedTTL {
 			if l := taggedOnDisk(); l != nil {
-				taggedL, taggedAt = l, fi.ModTime()
-				return l
+				taggedL, taggedAt, taggedWhy = l, fi.ModTime(), nil
+				return l, nil
 			}
 		}
 	}
@@ -127,10 +167,13 @@ func TaggedRepos(ctx context.Context) []Tagged {
 	if last == nil {
 		last = taggedOnDisk()
 	}
-	if l, whole, err := askTagged(ctx, last); err == nil {
-		taggedL, taggedAt = l, time.Now()
+	if l, whole, missing, err := askTagged(ctx, last); err == nil {
+		taggedL, taggedAt, taggedWhy = l, time.Now(), nil
 		if !whole {
 			taggedAt = time.Now().Add(-taggedTTL + taggedRetry)
+		}
+		if missing != nil {
+			taggedWhy = missing
 		}
 		if b, err := json.Marshal(l); err == nil {
 			_ = os.MkdirAll(filepath.Dir(taggedCache()), 0o755)
@@ -138,24 +181,35 @@ func TaggedRepos(ctx context.Context) []Tagged {
 			// a magpie started again meanwhile asks again too
 			_ = os.Chtimes(taggedCache(), taggedAt, taggedAt)
 		}
-		return l
+		return l, taggedWhy
+	} else {
+		// GitHub didn't answer: what it said last, asked again in a
+		// minute, and why it is that
+		l := last
+		if l == nil {
+			l = []Tagged{}
+		}
+		taggedL, taggedAt, taggedWhy = l, time.Now().Add(-taggedTTL+time.Minute), err
+		return l, err
 	}
-	// GitHub didn't answer: what it said last, asked again in a minute
-	l := last
-	if l == nil {
-		l = []Tagged{}
+}
+
+// TaggedAskAgain has the next TaggedRepos ask GitHub at once, when what
+// stands now isn't its whole answer: the Plugins page's Try again. A list
+// GitHub gave whole stands its ten minutes all the same.
+func TaggedAskAgain() {
+	taggedMu.Lock()
+	defer taggedMu.Unlock()
+	if taggedWhy != nil {
+		taggedAt = time.Time{}
 	}
-	taggedL, taggedAt = l, time.Now().Add(-taggedTTL+time.Minute)
-	return l
 }
 
 // askTagged asks GitHub's search, and reads each repository it names
 // that wasn't read at its last push. whole is false when a repository was
 // left out for want of an answer in taggedWait: it is then as last had
-// it, if it had it.
-func askTagged(ctx context.Context, last []Tagged) (l []Tagged, whole bool, err error) {
-	c, cancel := context.WithTimeout(ctx, taggedWait)
-	defer cancel()
+// it, if it had it, and missing counts those last didn't have.
+func askTagged(ctx context.Context, last []Tagged) (l []Tagged, whole bool, missing *TaggedMissing, err error) {
 	type item struct {
 		FullName      string    `json:"full_name"`
 		HTMLURL       string    `json:"html_url"`
@@ -180,16 +234,18 @@ func askTagged(ctx context.Context, last []Tagged) (l []Tagged, whole bool, err 
 	for page := 1; page*taggedPage <= 1000; page++ {
 		v := url.Values{"q": {"topic:" + Topic + " archived:false fork:false"}, "sort": {"stars"}, "order": {"desc"},
 			"per_page": {strconv.Itoa(taggedPage)}, "page": {strconv.Itoa(page)}}
-		b, err := fetchJSON(c, githubAPI+"/search/repositories?"+v.Encode(), 4<<20)
+		sc, cancel := context.WithTimeout(ctx, taggedSearch)
+		b, err := fetchJSON(sc, githubAPI+"/search/repositories?"+v.Encode(), 4<<20)
+		cancel()
 		if err != nil {
-			return nil, false, err
+			return nil, false, nil, err
 		}
 		var p struct {
 			Total int    `json:"total_count"`
 			Items []item `json:"items"`
 		}
 		if err := json.Unmarshal(b, &p); err != nil {
-			return nil, false, err
+			return nil, false, nil, err
 		}
 		for _, it := range p.Items {
 			// a repository starred between two pages can show on both
@@ -202,6 +258,8 @@ func askTagged(ctx context.Context, last []Tagged) (l []Tagged, whole bool, err 
 			break
 		}
 	}
+	c, cancel := context.WithTimeout(ctx, taggedWait)
+	defer cancel()
 	before := map[string]Tagged{}
 	for _, t := range last {
 		before[strings.ToLower(t.Repo)] = t
@@ -209,10 +267,14 @@ func askTagged(ctx context.Context, last []Tagged) (l []Tagged, whole bool, err 
 	// what the search says now, over what is kept of a repository
 	fresh := func(r, t Tagged) Tagged {
 		r.URL, r.Owner, r.OwnerAvatar, r.Description, r.Stars, r.License, r.Pushed = t.URL, t.Owner, t.OwnerAvatar, t.Description, t.Stars, t.License, t.Pushed
+		if r.License == "" {
+			r.License = r.PkgLicense
+		}
 		return r
 	}
-	var mu sync.Mutex // out, keep, done; late once the page stops waiting
+	var mu sync.Mutex // out, keep, done, why; late once the page stops waiting
 	late := false
+	var why error // a read GitHub or npm didn't answer, the last one
 	out := make([]Tagged, len(r.Items))
 	keep := make([]bool, len(r.Items))
 	done := make([]bool, len(r.Items))
@@ -255,7 +317,7 @@ func askTagged(ctx context.Context, last []Tagged) (l []Tagged, whole bool, err 
 			defer func() { <-sem }()
 			pc, cancel := context.WithTimeout(bg, taggedEach)
 			defer cancel()
-			got, ok, read := readTagged(pc, t, branch)
+			got, ok, read, rerr := readTagged(pc, t, branch)
 			if read {
 				readMu.Lock()
 				if ok {
@@ -270,6 +332,9 @@ func askTagged(ctx context.Context, last []Tagged) (l []Tagged, whole bool, err 
 				out[i], keep[i] = got, ok
 				// a package.json GitHub didn't answer for: not known
 				done[i] = ok || read
+				if !done[i] && rerr != nil {
+					why = rerr
+				}
 			}
 			mu.Unlock()
 		}(i, t, it.DefaultBranch)
@@ -292,6 +357,7 @@ func askTagged(ctx context.Context, last []Tagged) (l []Tagged, whole bool, err 
 	}
 	readMu.Unlock()
 	l, whole = []Tagged{}, true
+	gone := 0
 	for i := range out {
 		switch {
 		case keep[i]:
@@ -300,29 +366,44 @@ func askTagged(ctx context.Context, last []Tagged) (l []Tagged, whole bool, err 
 			whole = false
 			if was, ok := before[strings.ToLower(asked[i].Repo)]; ok {
 				l = append(l, fresh(was, asked[i]))
+			} else {
+				gone++
 			}
 		}
 	}
-	return l, whole, nil
+	if gone > 0 {
+		mu.Lock()
+		w := why
+		mu.Unlock()
+		if w == nil {
+			w = fmt.Errorf("%w in %s", ErrNoAnswer, taggedWait)
+		}
+		missing = &TaggedMissing{Missing: gone, Why: w}
+	}
+	return l, whole, missing, nil
 }
 
 // readTagged reads a tagged repository's package.json (on branch), and
 // npm's copy of the package it names: t as it is installed, whether it is
 // kept, and whether that is known (GitHub or npm not answering is not,
-// and it is read again next time).
-func readTagged(pc context.Context, t Tagged, branch string) (Tagged, bool, bool) {
+// and it is read again next time), with the read that didn't answer.
+func readTagged(pc context.Context, t Tagged, branch string) (Tagged, bool, bool, error) {
 	if branch == "" {
 		branch = "HEAD"
 	}
 	pb, err := fetchJSON(pc, githubRaw+"/"+t.Repo+"/"+url.PathEscape(branch)+"/package.json", 2<<20)
 	if err != nil {
-		return t, false, errors.Is(err, errNotFound)
+		if errors.Is(err, errNotFound) {
+			return t, false, true, nil
+		}
+		return t, false, false, err
 	}
 	var pj struct {
 		Name    string          `json:"name"`
 		Version string          `json:"version"`
 		Main    string          `json:"main"`
 		Exports json.RawMessage `json:"exports"`
+		License any             `json:"license"`
 		Magpie  struct {
 			Middleware string `json:"middleware"`
 			Agent      string `json:"agent"`
@@ -333,9 +414,17 @@ func readTagged(pc context.Context, t Tagged, branch string) (Tagged, bool, bool
 		} `json:"magpie"`
 	}
 	if json.Unmarshal(pb, &pj) != nil || !pkgName.MatchString(pj.Name) {
-		return t, false, true
+		return t, false, true, nil
 	}
 	t.Package, t.Version = pj.Name, pj.Version
+	// the licence it names, a string as npm takes it, for when GitHub
+	// couldn't tell one from its LICENSE file
+	if l, ok := pj.License.(string); ok {
+		t.PkgLicense = strings.TrimSpace(l)
+		if t.License == "" {
+			t.License = t.PkgLicense
+		}
+	}
 	// a picture, as host.js's iconOf takes one: magpie checks and
 	// keeps it before the page shows it (the GUI's /api/plugins/github)
 	t.Icon = ownIcon(pj.Magpie.Icon)
@@ -354,6 +443,10 @@ func readTagged(pc context.Context, t Tagged, branch string) (Tagged, bool, bool
 	// built only to publish), so it is installed from npm
 	b, err := fetchJSON(pc, npmRegistry+"/"+npmPath(pj.Name)+"/latest", 1<<20)
 	known := err == nil || errors.Is(err, errNotFound)
+	var unknown error
+	if !known {
+		unknown = err
+	}
 	// npmNames is whether npm's copy names what it loads (main,
 	// exports); one that names nothing loads an index file
 	npmNames := false
@@ -387,12 +480,14 @@ func readTagged(pc context.Context, t Tagged, branch string) (Tagged, bool, bool
 		if path.Ext(entry) != "" {
 			_, err := fetchJSON(pc, githubRaw+"/"+t.Repo+"/"+url.PathEscape(branch)+"/"+strings.TrimPrefix(path.Clean("/"+entry), "/"), 1)
 			if errors.Is(err, errNotFound) {
-				return t, false, known
+				return t, false, known, unknown
 			}
-			known = known && err == nil
+			if err != nil {
+				known, unknown = false, err
+			}
 		}
 	}
-	return t, true, known
+	return t, true, known, unknown
 }
 
 // pkgEntry is the file importing a package loads, as Bun resolves it: its

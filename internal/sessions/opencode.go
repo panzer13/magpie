@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/yetone/magpie/internal/appdir"
@@ -156,13 +157,13 @@ func fileExists(p string) bool {
 // at the top: a subagent's subagent counts there too.
 func ocRoots(out []file, parent map[string]string) []file {
 	for i := range out {
-		root := out[i].sid
+		root := out[i].m().sid
 		for n := 0; parent[root] != "" && n < 64; n++ {
 			root = parent[root]
 		}
 		out[i].key = out[i].agent + ":" + root
-		out[i].parent = parent[out[i].sid]
-		out[i].main = out[i].parent == ""
+		out[i].w().parent = parent[out[i].m().sid]
+		out[i].main = out[i].m().parent == ""
 	}
 	return out
 }
@@ -170,8 +171,24 @@ func ocRoots(out []file, parent map[string]string) []file {
 // ---- the database -------------------------------------------------------------
 
 // dbs are the databases open while List or Stats reads them, closed when
-// they are done (closeDBs).
+// the last of the reads using them is done (useDBs).
 var dbs = map[string]*sql.DB{}
+
+// dbUsers is how many reads use dbs now. A read lets mu go while it parses
+// with them, and another read may then start and end: it must not close
+// what the first is still reading (#2776).
+var dbUsers int
+
+// useDBs counts a read, with mu held, as a user of dbs until the release it
+// returns is called, with mu held again; the last to go closes them.
+func useDBs() (release func()) {
+	dbUsers++
+	return sync.OnceFunc(func() {
+		if dbUsers--; dbUsers == 0 {
+			closeDBs()
+		}
+	})
+}
 
 // Snapshot readers also remove their temporary database when a scan ends.
 var dbCleanup = map[string]func(){}
@@ -253,7 +270,7 @@ func ocDBRows(db *sql.DB, query, agent, path string, store ocStore, parent map[s
 			continue
 		}
 		parent[id] = par
-		out = append(out, file{agent: agent, path: path + "#" + id, sid: id, oc: store, size: n, mod: ms(max(updated, last))})
+		out = append(out, file{agent: agent, path: path + "#" + id, size: n, mod: ms(max(updated, last)), more: &fileMore{sid: id, oc: store}})
 	}
 	return out
 }
@@ -396,7 +413,7 @@ func openCodeJSONFiles(root string) []file {
 		if err != nil || json.Unmarshal(b, &i) != nil || i.ID == "" {
 			continue
 		}
-		f := file{agent: "opencode", path: p, sid: i.ID, oc: store}
+		f := file{agent: "opencode", path: p, more: &fileMore{sid: i.ID, oc: store}}
 		if !stat(&f) {
 			continue
 		}
@@ -450,10 +467,10 @@ func (s ocFiles) parts(mid string) [][]byte    { return s.docs(filepath.Join("pa
 // place as its reply goes on, so there is no reading on from before.
 func parseOpenCode(f file) *state {
 	s := &state{Size: f.size, Mod: f.mod.UnixNano()}
-	if f.oc == nil {
+	if f.m().oc == nil {
 		return s
 	}
-	info, ok := f.oc.info(f.sid)
+	info, ok := f.m().oc.info(f.m().sid)
 	if !ok {
 		return s
 	}
@@ -462,7 +479,7 @@ func parseOpenCode(f file) *state {
 		s.Named = t
 	}
 	var msgs []ocMessage
-	for _, b := range f.oc.messages(f.sid) {
+	for _, b := range f.m().oc.messages(f.m().sid) {
 		var m ocMessage
 		if json.Unmarshal(b, &m) == nil {
 			msgs = append(msgs, m)
@@ -481,7 +498,7 @@ func parseOpenCode(f file) *state {
 		switch m.Role {
 		case "user":
 			if typed := m.Semantics == nil || m.Semantics.Origin == "" || m.Semantics.Origin == "real_user"; typed && f.main && s.Title == "" && s.First == "" {
-				ocTitle(s, f.oc.parts(m.ID))
+				ocTitle(s, f.m().oc.parts(m.ID))
 			}
 		case "assistant":
 			if done := ms(m.Time.Completed); !done.IsZero() {

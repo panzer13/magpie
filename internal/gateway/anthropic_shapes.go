@@ -20,7 +20,10 @@ import (
 //     adaptive.display: Input should be 'summarized', 'omitted'";
 //   - the effort of each turn, as output_config on a {role: "system"}
 //     message inside messages: "messages.1.output_config: Extra inputs are
-//     not permitted".
+//     not permitted". OpenRouter's Anthropic endpoint takes it as a
+//     configuration_update and refuses that on DeepSeek and GLM:
+//     "Mid-conversation reasoning effort (configuration_update) is not
+//     supported on z-ai/glm-5.3-flash-20260826" (#3696).
 //
 // Claude Code mends either after the 400, once per conversation, sending
 // the request again without it; every new conversation asks again, and a
@@ -75,7 +78,7 @@ const (
 var (
 	displayValueRefused = regexp.MustCompile(`thinking\.(?:adaptive|enabled)\.display:? Input should be`)
 	displayRefused      = regexp.MustCompile(`thinking\.(?:adaptive|enabled)\.display:? Extra inputs are not permitted`)
-	turnEffortRefused   = regexp.MustCompile(`messages\.\d+\.output_config:? Extra inputs are not permitted`)
+	turnEffortRefused   = regexp.MustCompile(`messages\.\d+\.output_config:? Extra inputs are not permitted|Mid-conversation reasoning effort \(configuration_update\) is not supported`)
 	turnRoleRefused     = regexp.MustCompile(`messages\.(\d+)\.role\b`)
 	safeguardsRefused   = regexp.MustCompile(`\bsafeguards:? Extra inputs are not permitted`)
 	deferredRefused     = regexp.MustCompile("messages\\[\\d+\\]\\.content: unknown variant `(?:tool_addition|tool_removal|tool_definition|tool_reference)`")
@@ -188,7 +191,7 @@ func hasTurnEffort(body []byte) bool {
 		return false
 	}
 	found := false
-	gjson.GetBytes(body, "messages").ForEach(func(_, m gjson.Result) bool {
+	getIn(body, "messages").ForEach(func(_, m gjson.Result) bool {
 		found = m.Get("output_config").Exists()
 		return !found
 	})
@@ -322,7 +325,7 @@ func hasDeferredTools(body []byte) bool {
 		return false
 	}
 	found := false
-	gjson.GetBytes(body, "messages").ForEach(func(_, m gjson.Result) bool {
+	getIn(body, "messages").ForEach(func(_, m gjson.Result) bool {
 		m.Get("content").ForEach(func(_, b gjson.Result) bool {
 			found = deferredBlock(b.Get("type").String())
 			return !found
@@ -409,6 +412,22 @@ func toolLoadedText(name string) string {
 	return "Tool " + name + " is loaded and can be called now."
 }
 
+// toolRefs are the tools a tool_result's content names in tool_reference
+// blocks, as Claude Code's ToolSearch answers, in their order.
+func toolRefs(content json.RawMessage) []string {
+	if !bytes.Contains(content, []byte(`"tool_reference"`)) {
+		return nil
+	}
+	var names []string
+	gjson.ParseBytes(content).ForEach(func(_, b gjson.Result) bool {
+		if n := b.Get("tool_name").String(); b.Get("type").String() == "tool_reference" && n != "" {
+			names = append(names, n)
+		}
+		return true
+	})
+	return names
+}
+
 // refsOnly is a tool_result's content that is tool_reference blocks and
 // nothing else, as ToolSearch answers.
 func refsOnly(c gjson.Result) bool {
@@ -430,7 +449,7 @@ func hasRefsOnlyResult(body []byte) bool {
 		return false
 	}
 	found := false
-	gjson.GetBytes(body, "messages").ForEach(func(_, m gjson.Result) bool {
+	getIn(body, "messages").ForEach(func(_, m gjson.Result) bool {
 		m.Get("content").ForEach(func(_, b gjson.Result) bool {
 			found = b.Get("type").String() == "tool_result" && refsOnly(b.Get("content"))
 			return !found

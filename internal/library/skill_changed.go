@@ -15,17 +15,30 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"slices"
 	"sync"
 	"time"
 )
 
 // EditedError is an update refused because the skill was changed here
-// since it was fetched from GitHub.
-type EditedError struct{ Name string }
+// since it was fetched from GitHub, or From, the git repository it came
+// from.
+type EditedError struct{ Name, From string }
 
 func (e *EditedError) Error() string {
-	return fmt.Sprintf("%s was changed here since it was fetched from GitHub; updating it would replace those changes", e.Name)
+	from := e.From
+	if from == "" {
+		from = "GitHub"
+	}
+	return fmt.Sprintf("%s was changed here since it was fetched from %s; updating it would replace those changes", e.Name, from)
+}
+
+// editedError is the refusal of an update of s, naming where it came from.
+func editedError(s *Skill) *EditedError {
+	e := &EditedError{Name: s.Name}
+	if s.Source != nil && s.Source.Kind == "git" {
+		e.From = s.Source.Repo
+	}
+	return e
 }
 
 // edits remembers, for each skill's library folder, its hash as of when
@@ -72,7 +85,7 @@ func libraryHash(name string) string {
 // hash of what it fetched (installed before it did), or the folder can't
 // be read.
 func (l *Library) editState(s *Skill, targets []*Target) (edited, known bool) {
-	if s.Source == nil || s.Source.Kind != "github" || s.Hash == "" {
+	if !s.Source.remote() || s.Hash == "" {
 		return false, false
 	}
 	lib := skillDir(s.Name)
@@ -88,7 +101,7 @@ func (l *Library) editState(s *Skill, targets []*Target) (edited, known bool) {
 		return true, true
 	}
 	for _, t := range targets {
-		if t.Skills == "" || t.Desktop != nil || !slices.Contains(s.Agents, t.Agent.ID) {
+		if t.Skills == "" || t.Desktop != nil || !s.gives(t.Agent.ID) {
 			continue
 		}
 		p := filepath.Join(t.Skills, s.Name)

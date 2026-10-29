@@ -101,6 +101,11 @@ func (a *Agent) Apply(key, v string) error {
 	if f == nil {
 		return nil
 	}
+	// a found group named by its old id is written as it is listed now,
+	// auto/<model> (autoref.go)
+	if pub, ok := a.publicValue(v); ok {
+		v = pub
+	}
 	was := a.Values()
 	if err := f.Set(v); err != nil {
 		return err
@@ -314,8 +319,8 @@ func groupNamed(v string) string {
 	// magpie set (GroupFor takes it off; so does GroupFinder)
 	v = strings.TrimSuffix(strings.TrimSpace(v), "[1m]")
 	v = strings.TrimPrefix(v, magpieID+"/")
-	if strings.HasPrefix(v, provider.GroupPrefix) {
-		return v
+	if provider.IsGroupRef(v) {
+		return provider.CanonicalRef(v) // auto/<model> and group/auto-<slug> are one group
 	}
 	g, _ := provider.GroupFor(v)
 	return g
@@ -507,8 +512,19 @@ type Connection struct {
 	Value string `json:"value,omitempty"`
 }
 
+// Rewired, when set, is told of an agent that Connect or Disconnect
+// changed: the library gives Codex its servers another way on magpie.
+var Rewired func(id string)
+
+func (a *Agent) rewired(err error) {
+	if err == nil && Rewired != nil {
+		Rewired(a.ID)
+	}
+}
+
 // ConnectHow is Connect, saying how the model was chosen.
-func (a *Agent) ConnectHow() (Connection, error) {
+func (a *Agent) ConnectHow() (c Connection, err error) {
+	defer func() { a.rewired(err) }()
 	if a.Native != nil {
 		return Connection{How: "joined"}, a.Native.Connect()
 	}
@@ -716,7 +732,8 @@ func connectWas(v string, opts []Option) string {
 // still on magpie goes to its default, as picking it does, and so does
 // each one magpie set that reads as magpie set it (an effort). What magpie
 // remembered setting is forgotten.
-func (a *Agent) Disconnect() error {
+func (a *Agent) Disconnect() (err error) {
+	defer func() { a.rewired(err) }()
 	if a.Native != nil {
 		plan, err := a.Native.Disconnect()
 		if err != nil {
@@ -731,6 +748,8 @@ func (a *Agent) Disconnect() error {
 	// by itself (a start's Sync, Codex's account failover) puts magpie back
 	// in, this Disconnect's own writes included (paynezhuang on Discord)
 	stash(map[string]string{a.ID + disconnectedKey: "1"})
+	// the user's own say over a harness Kiro Crew's connect put on
+	kiroCrewUserLeft(a.ID)
 	before, rec := a.Values(), appliedOf(a.ID)
 	if a.Unwire != nil {
 		if err := a.Unwire(); err != nil {
@@ -821,6 +840,18 @@ func (a *Agent) reconnect(now map[string]string) (bool, error) {
 		f := a.Field(k)
 		if f == nil || rec.Magpie[k] != magpieID && !magpieValue(a, *f, rec.Magpie[k], rec.Magpie) {
 			return false, nil
+		}
+	}
+	// joined first, where the agent can be (Codex signed in with ChatGPT),
+	// as the switch connects it the first time: its own models stay
+	// through magpie beside the one put back. Put back on a routing group
+	// alone, Codex was beside its sign-in and not joined, so picking one
+	// of its own on the Agents page took it off magpie, every OpenAI model
+	// then said direct, and after a group again they said via magpie
+	// though a pick still went straight to OpenAI (NancyTom18 on X)
+	if a.Join != nil {
+		if _, err := a.Join(); err != nil {
+			return true, err
 		}
 	}
 	// the models on magpie first, as Connect sets them (setting Gemini

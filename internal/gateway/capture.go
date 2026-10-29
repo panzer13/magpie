@@ -39,10 +39,11 @@ func (c *capturedBody) add(p []byte) {
 
 func (c *capturedBody) text() string { return c.buf.String() }
 
+// captureRequestBody is a request's first callBodyLimit bytes, copied once:
+// through a capturedBody it was copied into a buffer and then again into
+// its string, 512 KiB for every request of 256 KiB or more.
 func captureRequestBody(p []byte) (string, bool) {
-	var c capturedBody
-	c.add(p)
-	return c.text(), c.truncated
+	return string(p[:min(len(p), callBodyLimit)]), len(p) > callBodyLimit
 }
 
 type captureResponseWriter struct {
@@ -153,6 +154,13 @@ func withBodies(rec *usage.Record, c *Call) {
 	in, inCut := c.RequestBody, c.RequestTruncated
 	if c.wholeIn != nil {
 		in, inCut = string(c.wholeIn), c.wholeInCut
+	}
+	if c.maskIn != nil {
+		if m := c.maskIn.body(); c.wholeIn != nil {
+			in = string(m)
+		} else {
+			in, inCut = captureRequestBody(m)
+		}
 	}
 	out, outCut := c.ResponseBody, c.ResponseTruncated
 	if c.wholeOut != nil {

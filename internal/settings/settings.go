@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"math"
 	"net/url"
 	"os"
@@ -34,15 +35,23 @@ import (
 	"github.com/yetone/magpie/internal/steady"
 )
 
+// CodexAutoReviewSession is the CodexAutoReview that runs Codex's
+// auto-review on the session's own model.
+const CodexAutoReviewSession = "session"
+
 // Settings is what the user chose. "" and "system" both mean "follow the OS".
 type Settings struct {
 	Theme string `json:"theme,omitempty"` // system | light | dark
 	// Colorblind switches chart series (--c1…--c7) to an Okabe–Ito palette
 	// and gives each quota curve window, and its legend key, a dash of its
 	// own (#2073).
-	Colorblind bool   `json:"colorblind,omitempty"`
-	Lang       string `json:"lang,omitempty"` // system | en | zh
-	Tray       string `json:"tray,omitempty"` // what clicking the tray icon opens: panel | window
+	Colorblind bool `json:"colorblind,omitempty"`
+	// ReduceMotion stills magpie's animations as the system's Reduce
+	// Motion does, for a computer or phone that the moving Routing page
+	// keeps busy (#3813).
+	ReduceMotion bool   `json:"reduceMotion,omitempty"`
+	Lang         string `json:"lang,omitempty"` // system | en | zh
+	Tray         string `json:"tray,omitempty"` // what clicking the tray icon opens: panel | window
 	// SessionTerminal is the Mac app that opens a resumed session, by bundle
 	// id. "" and "system" follow the .command file association. This
 	// computer's own (KeepOwn): another Mac may not have that app.
@@ -71,7 +80,13 @@ type Settings struct {
 	// environment and then the system, "direct" uses none, anything else
 	// is the proxy (http://, https:// or socks5://; host:port means http).
 	Proxy string `json:"proxy,omitempty"`
-	OTel  OTel   `json:"otel,omitempty"`
+	// ProxyCustom is the last proxy of the user's own Proxy held, kept
+	// while Proxy is "" or "direct" so that choosing Custom again in
+	// Settings brings back the address and login typed (Zane on Discord).
+	// Save sets it from Proxy, and it is stored as Proxy is. This
+	// computer's own (KeepOwn), as Proxy is.
+	ProxyCustom string `json:"proxyCustom,omitempty"`
+	OTel        OTel   `json:"otel,omitempty"`
 	// GitHubToken is a GitHub token the library's requests to GitHub's
 	// API carry, raising its rate limit from 60 requests an hour to 5,000.
 	// It is a secret: the Settings page is told only a masked one, and a
@@ -87,12 +102,49 @@ type Settings struct {
 	// RedactKinds turns the other kinds of personal data on or off one by
 	// one, by redact.Categories' ids (ssn, ip, home…), under
 	// RedactPersonal: only the user's choices, a kind not in it is as its
-	// category's On says.
-	Redact         bool            `json:"redact,omitempty"`
-	RedactPersonal bool            `json:"redactPersonal,omitempty"`
-	RedactKinds    map[string]bool `json:"redactKinds,omitempty"`
-	RedactWords    []string        `json:"redactWords,omitempty"`
-	RedactRules    []redact.Rule   `json:"redactRules,omitempty"`
+	// category's On says. RedactModel has a local model (internal/pii) find
+	// what the rules can't as well, a name or an address in free text,
+	// under Redact and RedactPersonal; it is this computer's own, as the
+	// model is downloaded on it. RedactShape sends a key as a made-up key
+	// of its own form (sk_… as another sk_…) instead of a placeholder
+	// (redact.Options.Shape; Charles Cao on X). RedactModelName is the
+	// local model picked (pii.PrivacyFilter, pii.AstrLinkGuard); "" for
+	// none picked, which pii.Choose reads. It is this computer's, as
+	// RedactModel is. RedactModelScore is each model's threshold the user
+	// set, by its id: masking drops what the model is less sure of (an
+	// AstrLink Guard user on X found 0.85 to 0.95 right for it). A model
+	// not in it has its own default (pii.Model.MinScore); this
+	// computer's too. RedactModelOff is the user turning the model off
+	// (Settings → Privacy's Off, a download cancelled, the model deleted):
+	// since 2026-10-28 it is on by default (masking.ModelWanted), and
+	// RedactModel says the user turned it on. RedactModelAuto says the
+	// default downloaded AstrLink Guard: a user who had a model on disk
+	// with RedactModel off before then had turned it off, and this one
+	// hasn't.
+	Redact           bool               `json:"redact,omitempty"`
+	RedactModelScore map[string]float64 `json:"redactModelScore,omitempty"`
+	RedactShape      bool               `json:"redactShape,omitempty"`
+	RedactModel      bool               `json:"redactModel,omitempty"`
+	RedactModelName  string             `json:"redactModelName,omitempty"`
+	RedactModelOff   bool               `json:"redactModelOff,omitempty"`
+	RedactModelAuto  bool               `json:"redactModelAuto,omitempty"`
+	RedactPersonal   bool               `json:"redactPersonal,omitempty"`
+	RedactKinds      map[string]bool    `json:"redactKinds,omitempty"`
+	RedactWords      []string           `json:"redactWords,omitempty"`
+	// RedactWordsAnyCase matches RedactWords in any case (ZoeCats on
+	// Discord); off, the default, a word is matched as written.
+	RedactWordsAnyCase bool `json:"redactWordsAnyCase,omitempty"`
+	// RedactWordsWhole matches RedactWords only as whole words (acmilan_
+	// on Discord); off, the default, a word is found inside longer ones too.
+	RedactWordsWhole bool          `json:"redactWordsWhole,omitempty"`
+	RedactRules      []redact.Rule `json:"redactRules,omitempty"`
+	// RedactActions is what is done with a value of a kind (redact.Hit's
+	// Kind: API_KEY, EMAIL, a rule's own…) other than masking it, where
+	// the user chose: redact.Warn sends it as written and records it,
+	// redact.Block holds the request back. RedactAllow are values sent
+	// as written whatever finds them, each whole, in any case (#1977).
+	RedactActions map[string]string `json:"redactActions,omitempty"`
+	RedactAllow   []string          `json:"redactAllow,omitempty"`
 	// LAN shares the gateway on the local network; remote callers must use
 	// named caller keys. LANKey is retained for older Magpie versions.
 	// LAN is this computer's own (KeepOwn; Lullaby on Discord: sharing
@@ -137,6 +189,17 @@ type Settings struct {
 	// RequestArchiveMaxMB is how much of each body the archive keeps, in
 	// MiB: 0 for 32, at most 1024 (#447)
 	RequestArchiveMaxMB int `json:"requestArchiveMaxMB,omitempty"`
+	// RequestArchiveLocal keeps the request archive on this computer's disk,
+	// in magpie's folder (gateway/archive_local.go), while sync has no S3
+	// bucket for it (CyberCaius on Discord). Its own switch, separate from
+	// RequestArchive, which sync carries to every computer: this computer's
+	// own (KeepOwn), so a request body is written to a disk only where the
+	// user turned it on.
+	RequestArchiveLocal bool `json:"requestArchiveLocal,omitempty"`
+	// RequestArchiveLocalMB is how large the archive on this computer grows
+	// before its oldest calls are removed, in MiB: 0 for 1024. In
+	// settings.json only; this computer's own (KeepOwn).
+	RequestArchiveLocalMB int `json:"requestArchiveLocalMB,omitempty"`
 	// GatewayConversations is local, opt-in recording of session traffic.
 	// Only SetGatewayConversations changes it; other saves keep local consent.
 	GatewayConversations bool `json:"gatewayConversations,omitempty"`
@@ -217,7 +280,10 @@ type Settings struct {
 	// CheckinOff are the accounts left out of their vendor's daily
 	// check-in while it is on (#1902), each by its entry in the vendor's
 	// check-in file: "<site or provider>|<account id>" ("workbuddy|<uid>",
-	// "trae-cn|<uid>", a plugin's "<provider>|<account>").
+	// "trae-cn|<uid>", a plugin's "<provider>|<sign-in key>", e.g.
+	// "autoclaw|autoclaw#x1y2z3"; before plugins#254 a plugin's was
+	// "<provider>|<display name>", which provider.adoptLegacyPluginCheckins
+	// carries over).
 	CheckinOff []string `json:"checkinOff,omitempty"`
 	// MemberModel has a reply's model name the routing group's member
 	// that answered, as magpie's provider/model id (workbuddy/glm-5.3-flash),
@@ -236,6 +302,15 @@ type Settings struct {
 	// real Claude Code, its billing line and identity line kept; off, as by
 	// default, the run is the shape every Claude Code run has.
 	ClaudeLeanPrompt bool `json:"claudeLeanPrompt,omitempty"`
+	// ClaudeRunsMost is how many Claude Code processes a Claude
+	// subscription may have running at once: conversations' runs, those
+	// waiting for a next turn or on tool results, and one-off tests and
+	// allowance reads alike. 0, as by default, has magpie size it from
+	// this machine's memory on Linux (its cgroup's limit, else MemTotal),
+	// and leaves it unbounded elsewhere: each Claude Code holds about
+	// 100 MiB of its own, and a 512 MiB service was OOM-killed (#2956).
+	// It is this machine's, not taken from another's settings.
+	ClaudeRunsMost int `json:"claudeRunsMost,omitempty"`
 	// RefusalRetries is how many more times a request the vendor's safety
 	// filter refused, with nothing said, is asked of another account or
 	// routing group member (#248), unset for every one left. 0 hands the
@@ -288,6 +363,13 @@ type Settings struct {
 	// checked against the SHA-256 the update feed at usemagpie.ai gives,
 	// never one from the mirror. magpie update mirror sets it.
 	UpdateMirror string `json:"updateMirror,omitempty"`
+	// UpdateChannel is which versions an update is offered: "" every
+	// version as it comes out, the default; UpdateStable ("stable") one a
+	// week, the newest that had been out three days as the week began, or
+	// an urgent one (a security hole, a ban risk, lost data) at once, from
+	// the update feed's ?channel=stable (ssharpcc on X). Settings' Update
+	// channel and magpie update channel set it.
+	UpdateChannel string `json:"updateChannel,omitempty"`
 	// Vision is the model that describes an image to a model that can't see
 	// it: a model's id (provider/model, group/<id>), "off" to turn such an
 	// image away, or empty for one magpie picks (see gateway.seer).
@@ -303,6 +385,16 @@ type Settings struct {
 	// "off" turns the video a request that names no model gets off too
 	// (gateway.videomaker).
 	ImageGen string `json:"imageGen,omitempty"`
+	// ImageTimeout is how long, in minutes, a vendor is given to draw an
+	// image and send it (neighbads on X: a slow image endpoint needs more
+	// than 5): from 1 to ImageTimeoutMost, 0 for ImageTimeoutDefault.
+	// ImageWait reads it.
+	ImageTimeout int `json:"imageTimeout,omitempty"`
+	// ClassifyTimeout is how long, in seconds, a routing group's classifier
+	// is given to say which intent a turn is (#2934: a Kiro subscription's
+	// haiku needed more than 8): from 1 to ClassifyTimeoutMost, 0 for
+	// ClassifyTimeoutDefault. ClassifyWait reads it.
+	ClassifyTimeout int `json:"classifyTimeout,omitempty"`
 	// Searcher is the provider that searches the web for a model that
 	// can't: "<provider>" with the small model magpie picks of it,
 	// "<provider>/<model>", or empty for the one magpie picks
@@ -350,8 +442,10 @@ type Settings struct {
 	// Lightweight lets the webview of a window closed — the tray panel or
 	// the main window — go once it has stayed closed a while, and makes it
 	// again when it is opened (#580): less memory, a moment's wait. This
-	// computer's own (KeepOwn).
-	Lightweight bool `json:"lightweight,omitempty"`
+	// computer's own (KeepOwn). Nil is off: a window made again on each
+	// opening was too slow to have by default (the owner, 10-21: "太卡");
+	// one who turned it on keeps it on (LightweightOn).
+	Lightweight *bool `json:"lightweight,omitempty"`
 	// KeepAwake keeps this computer from going to sleep by itself while
 	// agents work through the gateway and for a while after (xiao_wang24004
 	// on X; internal/awake). This computer's own (KeepOwn).
@@ -401,6 +495,11 @@ type Settings struct {
 	// notification (itieniu on X): a long task set going while the user
 	// works elsewhere. Only turns the app's own gateway serves; 0 is off.
 	TurnDoneAlert int `json:"turnDoneAlert,omitempty"`
+	// MaskAlert has magpie say with a notification when masking swaps a
+	// value it never masked before (Must2333 on X): its kind and how many,
+	// never the value, a burst said once and at most once a minute. Only
+	// requests the app's own gateway serves; off until turned on.
+	MaskAlert bool `json:"maskAlert,omitempty"`
 	// PlainNames has the model lists magpie gives agents name each model
 	// by its name alone, without its provider's or "routing group" after it
 	// (#335) — but for two in one list that would read the same, which keep
@@ -435,7 +534,8 @@ type Settings struct {
 	CodexTitles string `json:"codexTitles,omitempty"`
 	// CodexDescriptions is where the request Codex makes for a thread's
 	// description (thread_description: its own hidden turn, on Codex's own
-	// model through its ChatGPT sign-in) goes: "" as Codex sends it, or a
+	// model through its ChatGPT sign-in) goes: "" as Codex sends it, "off"
+	// answered by magpie with no description and sent nowhere, or a
 	// model's id (provider/model, group/<id>) that writes it. It is not
 	// CodexTitles: a description asks for {"description"} alone.
 	CodexDescriptions string `json:"codexDescriptions,omitempty"`
@@ -452,7 +552,10 @@ type Settings struct {
 	// in every entry of the list magpie hands Codex as
 	// auto_review_model_override, which Codex takes before its own
 	// codex-auto-review or the conversation's model at low effort. ""
-	// leaves the list as it was.
+	// leaves the list as it was. CodexAutoReviewSession has each of
+	// magpie's entries name itself, so the review runs on the session's
+	// model when that is one of magpie's, not on codex-auto-review through
+	// the ChatGPT sign-in (cybercaius on Discord).
 	CodexAutoReview string `json:"codexAutoReview,omitempty"`
 	// CodexSubagentModel is the model the gateway puts every subagent
 	// Codex spawns on (a request x-openai-subagent names collab_spawn),
@@ -468,7 +571,7 @@ type Settings struct {
 	// DesktopSubagentEffort fixes Desktop's subagent tool turns at this
 	// reasoning level. Empty keeps the effort each request asks for.
 	DesktopSubagentEffort string `json:"desktopSubagentEffort,omitempty"`
-	// FullContext has Codex and Claude Code told a model's whole context
+	// FullContext has Codex, Claude Code and Grok Build told a model's whole context
 	// window. Off, a window above WorkingWindow is told as WorkingWindow,
 	// so they compact a long conversation there instead of sending ever
 	// more of it on every turn (X: Chen, a 1M DeepSeek model through
@@ -547,6 +650,15 @@ type Settings struct {
 	// name, and routing, keys, caps and budgets go on by it. A pair taken
 	// out counts the client on its own again, the history with it.
 	ClientAgents map[string]string `json:"clientAgents,omitempty"`
+	// UsageCleared are the user's clears of the Usage page's figures
+	// (CrazyMouse_TT on X: a local model benchmarked again from nothing),
+	// each the calls up to its time, of one provider's model or of
+	// everything. Only what the usage pages report: usage.jsonl keeps every
+	// call, and a key's spending limit, the allowances' window holds and
+	// the gateway's own reads of its log still count them. It rides the
+	// settings part of a sync, so a clear holds on every computer that
+	// syncs with this one, other computers' shared days included.
+	UsageCleared []UsageClear `json:"usageCleared,omitempty"`
 	// Visible narrows the models an agent is shown, by agent id: the
 	// families (the tag a provider or group is given), provider ids and
 	// group ids its lists hold. An agent it doesn't name is shown them all.
@@ -607,7 +719,10 @@ type Settings struct {
 	ModelNames map[string]string `json:"modelNames,omitempty"`
 	// ModelEfforts are the reasoning levels the user keeps of a model's,
 	// by "<provider id>/<model id>": the lists magpie hands out offer only
-	// those (see provider.SetModelEfforts).
+	// those, while the vendor is still asked at any level it has; for a
+	// model with no levels known they are the levels given it, and the
+	// gateway fits a request to them (see provider.SetModelEfforts,
+	// magpie model spec).
 	ModelEfforts map[string][]string `json:"modelEfforts,omitempty"`
 	// ModelReasonless are the models the user said take no reasoning ask,
 	// by "<provider id>/<model id>": magpie offers them no levels and
@@ -664,6 +779,15 @@ type Settings struct {
 	// that model's maker's price (provider.SamePriceIn, #2344). Absent
 	// leaves it to its id.
 	ModelSameAs map[string]string `json:"modelSameAs,omitempty"`
+	// UsageAliases are the model ids the user counts as one in Usage and
+	// Sessions, from an id to the name it is counted under
+	// ("deepseek-v4.1-flash": "deepseek-flash", SlouchyQuill507 on
+	// Discord): what spent the same model under two names is one row there.
+	// Only how usage is grouped and shown changes: no request, model list
+	// or price reads it (provider.SetUsageAlias). Keyed by a bare model id,
+	// not "<provider>/<model>", so it is not named Model* and is not one
+	// of the per-model maps a provider's rename moves. Absent is none.
+	UsageAliases map[string]string `json:"usageAliases,omitempty"`
 	// ModelKinds is what the user said a model makes, by "<provider
 	// id>/<model id>": "image" or "video", for a provider set up with a
 	// base URL whose own model list doesn't say so (shen-joe, #1399).
@@ -775,6 +899,10 @@ func CheckModelPrice(key string, m ModelPrice) error {
 // provider it came through, its id lower-cased after it.
 const AnyProvider = "*/"
 
+// UpdateStable is UpdateChannel's Stable: a version a week, an urgent one
+// at once.
+const UpdateStable = "stable"
+
 // anArticle is the article a word takes where a message names it, so that an
 // input price is not "a input price".
 func anArticle(word string) string {
@@ -818,6 +946,46 @@ func Arrange[T any](s Settings, items []T, id func(T) string) (shown, hidden []T
 	return shown, hidden
 }
 
+// ImageTimeoutDefault is the minutes an image is given to be drawn when
+// ImageTimeout is 0, and ImageTimeoutMost the most it can be set to.
+const (
+	ImageTimeoutDefault = 5
+	ImageTimeoutMost    = 60
+)
+
+// ImageWait is how long a vendor is given to draw an image and send it:
+// ImageTimeout's minutes, ImageTimeoutDefault's when it is 0 (or below),
+// and no more than ImageTimeoutMost's when settings.json was written by
+// hand past it.
+func (s Settings) ImageWait() time.Duration {
+	m := s.ImageTimeout
+	if m < 1 {
+		m = ImageTimeoutDefault
+	}
+	return time.Duration(min(m, ImageTimeoutMost)) * time.Minute
+}
+
+// ClassifyTimeoutDefault is the seconds a classifier is given when
+// ClassifyTimeout is 0, and ClassifyTimeoutMost the most it can be set to:
+// the turn waits on it before it goes anywhere, with nothing sent to its
+// agent meanwhile.
+const (
+	ClassifyTimeoutDefault = 8
+	ClassifyTimeoutMost    = 60
+)
+
+// ClassifyWait is how long a classifier is given to answer:
+// ClassifyTimeout's seconds, ClassifyTimeoutDefault's when it is 0 (or
+// below), and no more than ClassifyTimeoutMost's when settings.json was
+// written by hand past it.
+func (s Settings) ClassifyWait() time.Duration {
+	n := s.ClassifyTimeout
+	if n < 1 {
+		n = ClassifyTimeoutDefault
+	}
+	return time.Duration(min(n, ClassifyTimeoutMost)) * time.Second
+}
+
 // Themes and Langs are the accepted values, in the order the UI offers them.
 var (
 	Themes     = []string{"system", "light", "dark"}
@@ -828,6 +996,8 @@ var (
 	Warmups = []string{"", "week", "all"}
 	// TrayEvery are TrayUsageEvery's values, in minutes.
 	TrayEvery = []int{1, 3, 5, 10, 30}
+	// UpdateChannels are UpdateChannel's values: every version, Stable.
+	UpdateChannels = []string{"", UpdateStable}
 	// UpdateEveries are UpdateEvery's values, in minutes.
 	UpdateEveries = []int{30, 60, 360, 1440}
 	// TextSizes are TextSize's values, in percent. None is under 100: the
@@ -927,6 +1097,13 @@ func CarryPerModel(in, cur *Settings) {
 // models that can take more.
 const WorkingWindow = 272000
 
+// LightweightOn says whether lightweight mode is on: only when the user
+// turned it on. It was on for a user who never chose, since a hidden
+// webview kept for good holds what its page drew while hidden (~20 MB a
+// minute on Windows under steady requests, #2515), but each opening then
+// waited for the page to load again.
+func (s Settings) LightweightOn() bool { return s.Lightweight != nil && *s.Lightweight }
+
 // Working is the context window an agent is told for a model with one of
 // n tokens (see FullContext).
 func (s Settings) Working(n int) int {
@@ -955,13 +1132,16 @@ func (s Settings) Compact() int {
 // is shared on the local network and the addresses let in to it, the
 // Dock, gateway mode, whether WSL is looked in, whether agents' sign-ins
 // are read, when allowances are read, the terminal app a session resumes
-// in, and what the menu bar or tray shows beside magpie's icon (yoooo on
+// in, whether the local masking model is on (it is downloaded on this
+// computer alone), how many Claude Code processes may run (its memory),
+// and what the menu bar or tray shows beside magpie's icon (yoooo on
 // Discord: usage turned off on a Mac came back from a Windows box that
 // shows it; Lullaby: sharing turned on at home came on at work).
 func (s *Settings) KeepOwn(cur Settings) {
 	s.GatewayConversations = cur.GatewayConversations
 	s.UIFont, s.CodeFont = cur.UIFont, cur.CodeFont
 	s.Window, s.Proxy, s.Port, s.Dock, s.DockWindow, s.Lightweight = cur.Window, cur.Proxy, cur.Port, cur.Dock, cur.DockWindow, cur.Lightweight
+	s.ProxyCustom = cur.ProxyCustom
 	s.WindowMaximised, s.KeepAwake, s.KeepAwakeDisplay = cur.WindowMaximised, cur.KeepAwake, cur.KeepAwakeDisplay
 	s.TrayUsages, s.TrayUsage, s.TrayUsageEvery, s.TrayNoLogos, s.TrayNoBird, s.TrayPace, s.TrayNoCost = cur.TrayUsages, cur.TrayUsage, cur.TrayUsageEvery, cur.TrayNoLogos, cur.TrayNoBird, cur.TrayPace, cur.TrayNoCost
 	s.GatewayMode = cur.GatewayMode
@@ -971,6 +1151,10 @@ func (s *Settings) KeepOwn(cur Settings) {
 	s.LAN, s.AllowIPs = cur.LAN, cur.AllowIPs
 	s.FetchPrivate = cur.FetchPrivate
 	s.SessionTerminal = cur.SessionTerminal
+	s.RedactModel, s.RedactModelName, s.RedactModelScore = cur.RedactModel, cur.RedactModelName, cur.RedactModelScore
+	s.RedactModelOff, s.RedactModelAuto = cur.RedactModelOff, cur.RedactModelAuto
+	s.ClaudeRunsMost = cur.ClaudeRunsMost
+	s.RequestArchiveLocal, s.RequestArchiveLocalMB = cur.RequestArchiveLocal, cur.RequestArchiveLocalMB
 }
 
 // RenamePerModel moves what the user said of a provider's models to the id
@@ -1025,6 +1209,22 @@ func Portable() string { return appdir.Portable() }
 // writing them in place rather than replacing their inode.
 var fileMu sync.RWMutex
 
+// writing is set while fileMu is held for a write: what a write is made
+// from is read from the disk even while a request holds what was read
+// (filememo.Hold), or a change another magpie or the user made in the
+// held second would be written over. Only set or read under fileMu.
+var writing bool
+
+// lockFile takes fileMu for a write, and returns what lets it go.
+func lockFile() (unlock func()) {
+	fileMu.Lock()
+	writing = true
+	return func() {
+		writing = false
+		fileMu.Unlock()
+	}
+}
+
 // Load reads the settings; anything missing or unreadable is the default.
 func Load() Settings {
 	fileMu.RLock()
@@ -1045,6 +1245,46 @@ func LoadChecked() (Settings, error) {
 	return loadChecked()
 }
 
+// Shared is Load without a copy of its own: the settings every caller of
+// Shared is given for the same settings.json, for a look made on each
+// gateway request (redaction, wires, efforts, images). Only for reading:
+// a caller never writes into its maps or slices (append reallocates, as
+// each slice is held at its length), and one that changes anything takes
+// Load's copy instead. Unreadable, it is Load's defaults as they are.
+func Shared() Settings {
+	fileMu.RLock()
+	defer fileMu.RUnlock()
+	b, err := filememo.Read("settings", Path(), func(b []byte) ([]byte, error) { return b, nil })
+	if err != nil {
+		return load()
+	}
+	if s, ok := sharedFor(b); ok {
+		return s
+	}
+	s, err := parse(b)
+	if err != nil {
+		return s
+	}
+	if s, ok := sharedFor(b); ok {
+		return s
+	}
+	return s
+}
+
+// sharedFor is the shared Settings parse keeps for contents b, when it
+// keeps them.
+func sharedFor(b []byte) (Settings, bool) {
+	parsed.Lock()
+	defer parsed.Unlock()
+	if parsed.raw == nil || !bytes.Equal(parsed.raw, b) {
+		return Settings{}, false
+	}
+	if !parsed.normed {
+		parsed.norm, parsed.normed = parsed.s.clone().normal().clone(), true
+	}
+	return parsed.norm, true
+}
+
 // load is called with fileMu held for reading or writing.
 func load() Settings {
 	s, _ := loadChecked()
@@ -1057,33 +1297,63 @@ func loadChecked() (Settings, error) {
 	// read again only once the file changed: a look at the agents asks for
 	// the settings for every model of every agent (hundreds of reads, a
 	// fifth of the Agents page's wait)
-	b, err := filememo.Read("settings", Path(), func(b []byte) ([]byte, error) { return b, nil })
+	through := filememo.Read[[]byte]
+	if writing {
+		through = filememo.ReadNow[[]byte]
+	}
+	b, err := through("settings", Path(), func(b []byte) ([]byte, error) { return b, nil })
 	if err != nil {
 		if os.IsNotExist(err) {
 			return s.normal(), nil
 		}
 		return s.normal(), fmt.Errorf("could not read settings at %s: %w", Path(), err)
 	}
-	// parsed on every call: a caller that asks many times in one look holds
-	// what it read (provider.Hold's heldSettings) rather than asking again
 	return parse(b)
 }
 
+// parsed is the last settings.json that parsed whole and what it read as,
+// before normal (s), and after it for Shared (norm, once asked): a
+// gateway request asks for the settings a dozen times over, and parsing
+// the file each time was most of what a request allocated. Keyed on the
+// bytes themselves, so only the same contents read as the same settings.
+var parsed struct {
+	sync.Mutex
+	raw    []byte
+	s      Settings
+	norm   Settings
+	normed bool
+}
+
 // parse is settings.json's contents b read as Settings, from its last good
-// generation when b doesn't parse.
+// generation when b doesn't parse. Each call has a Settings of its own to
+// change: the one kept for the same bytes is cloned, never handed out.
 func parse(b []byte) (Settings, error) {
+	parsed.Lock()
+	if parsed.raw != nil && bytes.Equal(parsed.raw, b) {
+		s := parsed.s
+		parsed.Unlock()
+		return s.clone().normal(), nil
+	}
+	parsed.Unlock()
 	var s Settings
 	var err error
 	parses.Add(1)
-	if perr := json.Unmarshal(bytes.TrimPrefix(b, []byte("\xef\xbb\xbf")), &s); perr != nil {
-		// one left all zero by a crash (#1505) is its last good generation
-		bak, ferr := lastgood.Fallback(Path(), b, validSettings)
-		if ferr == nil {
-			s = Settings{}
-			_ = json.Unmarshal(bytes.TrimPrefix(bak, []byte("\xef\xbb\xbf")), &s)
-		} else if len(bytes.TrimSpace(bytes.TrimPrefix(b, []byte("\xef\xbb\xbf")))) != 0 {
-			err = fmt.Errorf("could not read settings at %s: %w", Path(), perr)
-		}
+	perr := json.Unmarshal(bytes.TrimPrefix(b, []byte("\xef\xbb\xbf")), &s)
+	if perr == nil {
+		// only what parsed whole is kept: a last good generation read in
+		// its place is read again, as is a file that can't be read at all
+		parsed.Lock()
+		parsed.raw, parsed.s, parsed.norm, parsed.normed = bytes.Clone(b), s, Settings{}, false
+		parsed.Unlock()
+		return s.clone().normal(), nil
+	}
+	// one left all zero by a crash (#1505) is its last good generation
+	bak, ferr := lastgood.Fallback(Path(), b, validSettings)
+	if ferr == nil {
+		s = Settings{}
+		_ = json.Unmarshal(bytes.TrimPrefix(bak, []byte("\xef\xbb\xbf")), &s)
+	} else if len(bytes.TrimSpace(bytes.TrimPrefix(b, []byte("\xef\xbb\xbf")))) != 0 {
+		err = fmt.Errorf("could not read settings at %s: %w", Path(), perr)
 	}
 	return s.normal(), err
 }
@@ -1159,19 +1429,118 @@ func SavedAddr() string {
 
 // Save validates and writes the settings, preserving current recording consent.
 func Save(s Settings) error {
-	fileMu.Lock()
-	defer fileMu.Unlock()
+	defer lockFile()()
 	return save(s, false)
 }
 
 // SetGatewayConversations changes local recording consent without overwriting
 // other settings from an earlier snapshot.
 func SetGatewayConversations(on bool) error {
-	fileMu.Lock()
-	defer fileMu.Unlock()
+	defer lockFile()()
 	s := load()
 	s.GatewayConversations = on
 	return save(s, true)
+}
+
+// EditCheckinOff changes CheckinOff alone, as edit returns it from what the
+// file holds now, so a save elsewhere from an older snapshot isn't undone.
+// A settings file that can't be read is left as it is, with the error.
+func EditCheckinOff(edit func([]string) []string) error {
+	defer lockFile()()
+	s, err := loadChecked()
+	if err != nil {
+		return err
+	}
+	off := edit(slices.Clone(s.CheckinOff))
+	if len(off) == 0 {
+		off = nil
+	}
+	s.CheckinOff = off
+	return save(s, false)
+}
+
+// EditUsageAliases changes UsageAliases alone, as edit returns them from
+// what the file holds now, so a save elsewhere from an older snapshot isn't
+// undone. A settings file that can't be read is left as it is, with the
+// error: what it holds is unknown, not "no aliases". edit is given a copy,
+// and an error from it saves nothing.
+func EditUsageAliases(edit func(map[string]string) (map[string]string, error)) error {
+	defer lockFile()()
+	s, err := loadChecked()
+	if err != nil {
+		return err
+	}
+	m, err := edit(maps.Clone(s.UsageAliases))
+	if err != nil {
+		return err
+	}
+	if len(m) == 0 {
+		m = nil
+	}
+	s.UsageAliases = m
+	return save(s, false)
+}
+
+// SetRedactModel turns the local masking model on or off, on its own, as
+// Settings → Privacy does once the model is downloaded; off is the
+// user's own (RedactModelOff), which the default never turns on again.
+func SetRedactModel(on bool) error {
+	defer lockFile()()
+	s := load()
+	s.RedactModel, s.RedactModelOff = on, !on
+	return save(s, false)
+}
+
+// UseDefaultRedactModel saves name as the model on by default once it is
+// downloaded (RedactModelAuto), unless the user picked one or turned it
+// off in between: it says whether it did.
+func UseDefaultRedactModel(name string) (bool, error) {
+	defer lockFile()()
+	s := load()
+	if s.RedactModelName != "" || s.RedactModelOff || s.RedactModel {
+		return false, nil
+	}
+	s.RedactModelName, s.RedactModelAuto = name, true
+	return true, save(s, false)
+}
+
+// SetRedactModelName keeps the local model the user picked while it is
+// off, for turning it on.
+func SetRedactModelName(name string) error {
+	defer lockFile()()
+	s := load()
+	s.RedactModelName = name
+	return save(s, false)
+}
+
+// SetRedactModelScore keeps score as the local model id's threshold; 0
+// is back to the model's own.
+func SetRedactModelScore(id string, score float64) error {
+	defer lockFile()()
+	s := load()
+	m := maps.Clone(s.RedactModelScore)
+	if m == nil {
+		m = map[string]float64{}
+	}
+	if score == 0 {
+		delete(m, id)
+	} else {
+		m[id] = score
+	}
+	if len(m) == 0 {
+		m = nil
+	}
+	s.RedactModelScore = m
+	return save(s, false)
+}
+
+// UseRedactModel turns the local masking model on as name, the model
+// the user picked, once that model is downloaded.
+func UseRedactModel(name string) error {
+	defer lockFile()()
+	s := load()
+	s.RedactModel, s.RedactModelName, s.RedactModelOff = true, name, false
+	return save(s, false)
 }
 
 // save is called under fileMu. Only the consent setter may replace recording.
@@ -1220,10 +1589,19 @@ func save(s Settings, recording bool) error {
 	if !slices.Contains(UpdateEveries, s.UpdateEvery) {
 		return fmt.Errorf("magpie checks for updates every %v minutes, not %d", UpdateEveries, s.UpdateEvery)
 	}
+	if !slices.Contains(UpdateChannels, s.UpdateChannel) {
+		return fmt.Errorf("the update channel is %q (stable) or empty (every version), not %q", UpdateStable, s.UpdateChannel)
+	}
 	if m := s.UpdateMirror; m != "" {
 		if u, err := url.Parse(m); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
 			return fmt.Errorf("an update mirror is an http(s) address put before the github.com URL, like https://mirror.example/, not %q", m)
 		}
+	}
+	if s.ImageTimeout < 0 || s.ImageTimeout > ImageTimeoutMost {
+		return fmt.Errorf("image generation is given from 1 to %d minutes, or 0 for %d, not %d", ImageTimeoutMost, ImageTimeoutDefault, s.ImageTimeout)
+	}
+	if s.ClassifyTimeout < 0 || s.ClassifyTimeout > ClassifyTimeoutMost {
+		return fmt.Errorf("a routing group's classifier is given from 1 to %d seconds, or 0 for %d, not %d", ClassifyTimeoutMost, ClassifyTimeoutDefault, s.ClassifyTimeout)
 	}
 	if s.UsageAlert < 0 || s.UsageAlert > 100 {
 		return fmt.Errorf("a usage alert is at a percentage from 1 to 100, or 0 for off, not %d", s.UsageAlert)
@@ -1254,6 +1632,9 @@ func save(s Settings, recording bool) error {
 	if err := CheckProxy(s.Proxy); err != nil {
 		return err
 	}
+	if s.Proxy != "" && s.Proxy != "direct" {
+		s.ProxyCustom = s.Proxy
+	}
 	s.Vision = strings.TrimSpace(s.Vision)
 	if s.Vision != "" && s.Vision != "off" && !strings.Contains(s.Vision, "/") {
 		return fmt.Errorf("the vision model must be a model's id such as openai/gpt-5-mini, or off, not %q", s.Vision)
@@ -1263,15 +1644,15 @@ func save(s Settings, recording bool) error {
 		return fmt.Errorf("the model for Codex's titles must be a model's id such as openai/gpt-5-mini, or off, not %q", s.CodexTitles)
 	}
 	s.CodexDescriptions = strings.TrimSpace(s.CodexDescriptions)
-	if s.CodexDescriptions != "" && !strings.Contains(s.CodexDescriptions, "/") {
-		return fmt.Errorf("the model for Codex's descriptions must be a model's id such as openai/gpt-5-mini, not %q", s.CodexDescriptions)
+	if s.CodexDescriptions != "" && s.CodexDescriptions != "off" && !strings.Contains(s.CodexDescriptions, "/") {
+		return fmt.Errorf("the model for Codex's descriptions must be a model's id such as openai/gpt-5-mini, or off, not %q", s.CodexDescriptions)
 	}
 	s.CodexPredictions = strings.TrimSpace(s.CodexPredictions)
 	if s.CodexPredictions != "" && s.CodexPredictions != "off" && !strings.Contains(s.CodexPredictions, "/") {
 		return fmt.Errorf("the model for Codex's composer predictions must be a model's id such as openai/gpt-5-mini, or off, not %q", s.CodexPredictions)
 	}
 	s.CodexAutoReview = strings.TrimSpace(s.CodexAutoReview)
-	if s.CodexAutoReview != "" && !strings.Contains(s.CodexAutoReview, "/") {
+	if s.CodexAutoReview != "" && s.CodexAutoReview != CodexAutoReviewSession && !strings.Contains(s.CodexAutoReview, "/") {
 		return fmt.Errorf("the model for Codex's auto-review must be a model's id such as openai/gpt-5-mini, not %q", s.CodexAutoReview)
 	}
 	s.CodexSubagentModel = strings.TrimSpace(s.CodexSubagentModel)
@@ -1307,11 +1688,18 @@ func save(s Settings, recording bool) error {
 		return err
 	}
 	s.RedactRules = rules
+	if s.RedactActions, err = redactActions(s.RedactActions); err != nil {
+		return err
+	}
+	if s.RedactAllow, err = redactAllow(s.RedactAllow); err != nil {
+		return err
+	}
 	s.AgentOrder, s.AgentsHidden, s.AgentsShown = ids(s.AgentOrder), ids(s.AgentsHidden), ids(s.AgentsShown)
 	s.UsageOrder = ids(s.UsageOrder)
 	s.PanelUsageHidden = ids(s.PanelUsageHidden)
 	s.UsageAgentsHidden = ids(s.UsageAgentsHidden)
 	s.ClientAgents = clientAgents(s.ClientAgents)
+	s.UsageCleared = usageCleared(s.UsageCleared)
 	s.TrayUsages = ids(s.TrayUsages)
 	for i, u := range s.CodexAutoReset {
 		s.CodexAutoReset[i] = strings.ToLower(u)
@@ -1528,6 +1916,102 @@ func clientAgents(m map[string]string) map[string]string {
 		return nil
 	}
 	return out
+}
+
+// UsageClear is one clear of the Usage page's figures: the calls up to At
+// (Unix milliseconds) of Model at Provider, as the page's Models list
+// names them (the model counted under its usage alias, the provider under
+// the id it is shown by now), stop being counted there. Both "" is every
+// call.
+type UsageClear struct {
+	Provider string `json:"provider,omitempty"`
+	Model    string `json:"model,omitempty"`
+	At       int64  `json:"at"`
+}
+
+// Time is when the clear was made.
+func (c UsageClear) Time() time.Time { return time.UnixMilli(c.At) }
+
+// Covers is whether c clears every call o clears: everything, or the same
+// model, up to a time no earlier.
+func (c UsageClear) Covers(o UsageClear) bool {
+	return c.At >= o.At && (c.Provider == "" && c.Model == "" || c.Provider == o.Provider && c.Model == o.Model)
+}
+
+// usageCleared is UsageCleared as kept: one without a time left out, and
+// one another covers (a later clear of everything, or of the same model)
+// dropped, so the list holds no more than one a model.
+func usageCleared(in []UsageClear) []UsageClear {
+	var out []UsageClear
+	for i, c := range in {
+		c.Provider, c.Model = strings.TrimSpace(c.Provider), strings.TrimSpace(c.Model)
+		if c.At <= 0 {
+			continue
+		}
+		covered := false
+		for j, o := range in {
+			o.Provider, o.Model = strings.TrimSpace(o.Provider), strings.TrimSpace(o.Model)
+			// of two the same, the first is kept
+			if j != i && o.At > 0 && o.Covers(c) && (!c.Covers(o) || j < i) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// ClearUsage adds a clear of the Usage page's figures up to at: of model at
+// provider, or of everything with both "". It changes UsageCleared alone,
+// from what the file holds now, so a save elsewhere from an older snapshot
+// isn't undone; a settings file that can't be read is left as it is, with
+// the error.
+func ClearUsage(provider, model string, at time.Time) error {
+	provider, model = strings.TrimSpace(provider), strings.TrimSpace(model)
+	if model == "" && provider != "" {
+		return fmt.Errorf("a clear of %q's usage names its model", provider)
+	}
+	if at.UnixMilli() <= 0 {
+		return fmt.Errorf("a clear of usage needs a time")
+	}
+	defer lockFile()()
+	s, err := loadChecked()
+	if err != nil {
+		return err
+	}
+	s.UsageCleared = usageCleared(append(slices.Clone(s.UsageCleared), UsageClear{Provider: provider, Model: model, At: at.UnixMilli()}))
+	return save(s, false)
+}
+
+// UsageClearedNow is Load().UsageCleared, parsed again only once the file
+// changed: every read of the usage pages asks for it.
+func UsageClearedNow() []UsageClear {
+	fileMu.RLock()
+	defer fileMu.RUnlock()
+	m, err := filememo.Read("settings.usageCleared", Path(), func(b []byte) ([]UsageClear, error) {
+		if len(bytes.TrimSpace(b)) == 0 {
+			return nil, nil
+		}
+		var s struct {
+			UsageCleared []UsageClear `json:"usageCleared"`
+		}
+		if err := json.Unmarshal(b, &s); err != nil {
+			return nil, err
+		}
+		return usageCleared(s.UsageCleared), nil
+	})
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		// what load makes of a file that doesn't parse (its last good
+		// generation), not none
+		return usageCleared(load().UsageCleared)
+	}
+	return m
 }
 
 // ClientAgentsNow is Load().ClientAgents, parsed again only once the file

@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -40,10 +41,17 @@ const streamRetries = 2
 // again on the same account before it fails: once while its stream is
 // held, which the request then asks again, or of another account — or the
 // group of its next member — and as often as a cut reply once the client
-// has the stream, when nobody asks again after it.
+// has the stream, when nobody asks again after it. A held try whose
+// reasoning went through as it came (Gemini's on the last candidate,
+// LuckymanJC on Discord) is past the request's asking again, so it is
+// asked once more here in its place.
 func emptyRetries(w http.ResponseWriter, ctx context.Context) int {
-	if h, ok := w.(*holdWriter); ok && h.mayAskAgain() || inGroupTry(ctx) {
+	h, ok := w.(*holdWriter)
+	if ok && h.mayAskAgain() || inGroupTry(ctx) {
 		return 1
+	}
+	if ok && h.thoughtOnly() {
+		return streamRetries + 1
 	}
 	return streamRetries
 }
@@ -494,11 +502,11 @@ func (s *Server) streamTranslated(w http.ResponseWriter, r *http.Request, p prov
 			}
 			turnedAway := res.StatusCode == http.StatusTooManyRequests && antigravityTurnedAway(p, request.System, string(b))
 			if turnedAway {
-				failed += " — " + antigravityTurnedAwayHint
+				failed += " — " + antigravityHint(request.System)
 			}
 			if !cont.resume {
 				if turnedAway {
-					markAntigravityTurnsAway(w)
+					markAntigravityTurnsAway(w, request.System)
 				}
 				if p.Preset == "openrouter" && openRouterSharedPool(b) {
 					markOpenRouterSharedPool(w)
@@ -531,7 +539,20 @@ func (s *Server) streamTranslated(w http.ResponseWriter, r *http.Request, p prov
 				}
 				ended := false // the upstream said its reply ended
 				var tail chatTail
+				// the client is kept alive while the upstream says
+				// nothing at all, its first event yet to come too: the
+				// upstream's 200 is in, and a holdWriter holds what is
+				// written for another candidate to answer still
+				var wmu sync.Mutex
+				heard, stopKeep := keepThroughSilence(&wmu, func() {
+					if failed == "" && !cut && !relooped && sw.quiet() >= keepaliveEvery/2 {
+						enc.keepalive()
+					}
+				})
 				serr = readSSEAlive(rd, func(_, data string) error {
+					wmu.Lock()
+					defer wmu.Unlock()
+					heard()
 					tail.see([]byte(data))
 					st := upstreamStop([]byte(data))
 					u.add(Usage{Upstream: upstreamOf([]byte(data)), Stop: st, Tier: upstreamTier([]byte(data))})
@@ -543,7 +564,13 @@ func (s *Server) streamTranslated(w http.ResponseWriter, r *http.Request, p prov
 						return errStreamCut
 					}
 					return nil
-				}, alive)
+				}, func() {
+					wmu.Lock()
+					defer wmu.Unlock()
+					heard()
+					alive()
+				})
+				stopKeep()
 				res.Body.Close()
 				if errors.Is(serr, errStreamCut) {
 					serr = nil
@@ -651,8 +678,8 @@ func (s *Server) streamTranslated(w http.ResponseWriter, r *http.Request, p prov
 	}
 	if failed != "" && markAntigravityRefused(w, p, request.System, failed) {
 		// the same refusal as the 429's, said inside the reply
-		if !strings.HasSuffix(failed, antigravityTurnedAwayHint) {
-			failed += " — " + antigravityTurnedAwayHint
+		if hint := antigravityHint(request.System); !strings.HasSuffix(failed, hint) {
+			failed += " — " + hint
 		}
 		u.ErrType = turnedAwayErrType
 	}
