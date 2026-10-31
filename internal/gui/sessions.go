@@ -69,20 +69,20 @@ func gatewayDays(g usage.GatewaySession) []sessions.ExternalDayUsage {
 
 // gatewayListed is a gateway session as a list shows it: titled by what it
 // was first asked, when magpie recorded it, not by its ses_… id (YOU on
-// Discord)
-func gatewayListed(g usage.GatewaySession) sessions.ExternalSession {
+// Discord). title is a sessions.GatewayTitler's.
+func gatewayListed(g usage.GatewaySession, title func(agent, id string) string) sessions.ExternalSession {
 	e := gatewayExternal(g)
-	e.Title = sessions.GatewayTitle(g.Agent, g.ID)
+	e.Title = title(g.Agent, g.ID)
 	return e
 }
 
 func gatewaySession(g usage.GatewaySession) sessions.Session {
-	return sessions.MergeExternal(nil, []sessions.ExternalSession{gatewayListed(g)})[0]
+	return sessions.MergeExternal(nil, []sessions.ExternalSession{gatewayListed(g, sessions.GatewayTitle)})[0]
 }
 
 func sessionRoutes(mux *http.ServeMux, w Windows) {
 	warmSessions()
-	mux.HandleFunc("GET /api/sessions", func(rw http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /api/sessions", coldTurn(func(rw http.ResponseWriter, r *http.Request) {
 		// the list and the Codex threads' effort each list every session file
 		defer sessions.OneListing()()
 		n, _ := strconv.Atoi(r.URL.Query().Get("limit"))
@@ -108,18 +108,16 @@ func sessionRoutes(mux *http.ServeMux, w Windows) {
 		list := sessions.List(sessions.All)
 		nativeKeys := make(map[string]bool, len(list))
 		for _, s := range list {
+			// its copies' and subagents' ids among them
 			for _, k := range sessions.GatewayKeys(s) {
 				nativeKeys[k] = true
-			}
-			// a copy of its conversation is the agent's own too
-			for _, id := range s.Copies {
-				nativeKeys[s.Agent+"|"+id] = true
 			}
 		}
 		gateway := listedGateway(usage.GatewaySessions(time.Time{}, nativeKeys))
 		ext := make([]sessions.ExternalSession, 0, len(gateway))
+		title := sessions.GatewayTitler()
 		for _, g := range gateway {
-			ext = append(ext, gatewayListed(g))
+			ext = append(ext, gatewayListed(g, title))
 		}
 		list = sessions.MergeExternal(list, ext)
 		if len(list) > n {
@@ -146,8 +144,10 @@ func sessionRoutes(mux *http.ServeMux, w Windows) {
 		// was copied through every size on the way, ~140 MB of eight (#2278)
 		out.Sessions = make([]sessionJSON, 0, len(list))
 		for _, s := range list {
+			// drawn as the agent it ran in: Claude Desktop's Code tab's
+			// sessions are in Claude Code's folder (Session.App)
 			j := sessionJSON{Session: s, Name: s.Agent, Icon: "generic", Via: viaOf(vias, s)}
-			if a := agents[s.Agent]; a != nil {
+			if a := agents[cmp.Or(s.App, s.Agent)]; a != nil {
 				j.Name, j.Icon = a.SharedName(), a.Icon
 			}
 			j.Name = wslName(j.Name, s)
@@ -158,11 +158,11 @@ func sessionRoutes(mux *http.ServeMux, w Windows) {
 			Terminal bool     `json:"terminal"`
 			Dirs     []string `json:"dirs"`
 		}{out.Terminal, out.Dirs})
-	})
+	}))
 	// stats is every session's usage by day over the last ?days=N days
 	// (every day when 0 or none), cut by agent, folder and model for the
 	// page to filter; names are the agents' as the page shows them.
-	mux.HandleFunc("GET /api/sessions/stats", func(rw http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /api/sessions/stats", coldTurn(func(rw http.ResponseWriter, r *http.Request) {
 		defer sessions.ShareListing()()
 		n, _ := strconv.Atoi(r.URL.Query().Get("days"))
 		st, gen := statsForGen(n)
@@ -190,10 +190,7 @@ func sessionRoutes(mux *http.ServeMux, w Windows) {
 			rw.WriteHeader(http.StatusOK)
 			return
 		}
-		tag := writeJSONSame(rw, r, struct {
-			sessions.Stats
-			Agents map[string]string `json:"agents"`
-		}{st, agents})
+		tag := writeSame(rw, r, func(b *bytes.Buffer) error { return statsAnswer(b, st, agents) })
 		if tag != "" {
 			statsTags.Lock()
 			if statsTags.m == nil || len(statsTags.m) >= statsMemoMost {
@@ -202,11 +199,11 @@ func sessionRoutes(mux *http.ServeMux, w Windows) {
 			statsTags.m[n] = statsTag{gen, agents, tag}
 			statsTags.Unlock()
 		}
-	})
+	}))
 	// overview sums up the range's sessions under the page's filters:
 	// how many, what the middle one spent, how many each day, and the ones
 	// that spent the most.
-	mux.HandleFunc("GET /api/sessions/overview", func(rw http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /api/sessions/overview", coldTurn(func(rw http.ResponseWriter, r *http.Request) {
 		defer sessions.ShareListing()()
 		q := r.URL.Query()
 		n, _ := strconv.Atoi(q.Get("days"))
@@ -237,7 +234,7 @@ func sessionRoutes(mux *http.ServeMux, w Windows) {
 			}
 		}
 		writeJSON(rw, out)
-	})
+	}))
 	// progress is how far the reading of the session files has got, for
 	// the page to show while its first read takes a while.
 	mux.HandleFunc("GET /api/sessions/progress", func(rw http.ResponseWriter, r *http.Request) {
@@ -267,7 +264,7 @@ func sessionRoutes(mux *http.ServeMux, w Windows) {
 		}
 		j := sessionJSON{Session: s, Name: s.Agent, Icon: "generic"}
 		for _, a := range agent.Clients() {
-			if a.ID == s.Agent {
+			if a.ID == cmp.Or(s.App, s.Agent) {
 				j.Name, j.Icon = a.SharedName(), a.Icon
 			}
 		}
@@ -369,6 +366,35 @@ func sessionRoutes(mux *http.ServeMux, w Windows) {
 			return
 		}
 		if err := openTerminal(run, settings.Load().SessionTerminal); err != nil {
+			fail(rw, err)
+			return
+		}
+		rw.WriteHeader(http.StatusNoContent)
+	})
+	// agents/open opens Terminal on an agent of the Agents list: the command
+	// is made here from the agent as detected (agentCommand), and the page
+	// sends only its id.
+	mux.HandleFunc("POST /api/agents/open", func(rw http.ResponseWriter, r *http.Request) {
+		var in struct{ Agent string }
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			fail(rw, err)
+			return
+		}
+		if runtime.GOOS != "darwin" || isWeb(w) {
+			fail(rw, errors.New("opening Terminal is only for the Mac app"))
+			return
+		}
+		run := ""
+		for _, a := range agent.Detected() {
+			if a.ID == in.Agent {
+				run = agentCommand(a)
+			}
+		}
+		if run == "" {
+			fail(rw, errors.New("no command starts this agent"))
+			return
+		}
+		if err := agentTerminal(run, settings.Load().SessionTerminal); err != nil {
 			fail(rw, err)
 			return
 		}
@@ -608,8 +634,9 @@ func withGatewaySessions(st sessions.Stats, days int, nativeKeys map[string]bool
 	}
 	gs, gd := usage.GatewaySessionWindowExcept(since, nativeKeys)
 	ext := make([]sessions.ExternalSession, 0, len(gs))
+	title := sessions.GatewayTitler()
 	for _, g := range gs {
-		e := gatewayListed(g)
+		e := gatewayListed(g, title)
 		e.Daily = gatewayDays(g)
 		ext = append(ext, e)
 	}
@@ -678,18 +705,68 @@ func warmUp(steps ...func()) {
 	// that asks: an empty sandbox's warm-up looked at settings.json ~300
 	// times on Windows (#1665); a write still reads the disk (edit.Read)
 	defer filememo.Hold()()
+	defer coldTurns.over.Store(true)
 	for _, step := range steps {
-		step()
+		func() {
+			coldTurns.turn <- struct{}{}
+			defer coldTurnDone()
+			step()
+		}()
 	}
 	debug.FreeOSMemory()
 }
 
-// underTightGC runs fn letting the heap grow by a quarter of what it holds
+// coldTurns has the warm-up's reads and the pages' first asks take turns
+// until the warm-up is over. A first start's window asks the Sessions
+// page's stats and the Usage page's requests and heatmap while the
+// warm-up reads the same history, each a first read of it held beside the
+// others: ~150 MB of the asks' and ~40 MB of the warm-up's at once, a
+// ~300 MB live heap and a 420–480 MB footprint (#2278). Each reads after
+// the one before it has kept what it read, and most then find it kept.
+var coldTurns = struct {
+	turn chan struct{}
+	over atomic.Bool
+}{turn: make(chan struct{}, 1)}
+
+// coldTurnDone ends a turn. What the request matching kept for a next
+// read goes with it: kept for scratchLinger, it sat under the next
+// turn's read of the history.
+func coldTurnDone() {
+	usage.ReleaseMatchScratch()
+	<-coldTurns.turn
+}
+
+// coldTurnMost is how long a page waits for its turn: a warm-up stuck on
+// one read never keeps the pages from answering.
+const coldTurnMost = 2 * time.Minute
+
+// coldTurnsTaken is false in tests, whose pages and warm-ups are their own.
+var coldTurnsTaken = !testing.Testing()
+
+// coldTurn is h taking its turn while the warm-up isn't over; the
+// warm-up's reading goes at full speed while it waits (held's
+// sessions.Ask).
+func coldTurn(h http.HandlerFunc) http.HandlerFunc {
+	return func(rw http.ResponseWriter, r *http.Request) {
+		if coldTurnsTaken && !coldTurns.over.Load() {
+			t := time.NewTimer(coldTurnMost)
+			select {
+			case coldTurns.turn <- struct{}{}:
+				defer coldTurnDone()
+			case <-t.C:
+			}
+			t.Stop()
+		}
+		h(rw, r)
+	}
+}
+
+// underTightGC runs fn letting the heap grow by a tenth of what it holds
 // before a collection, not Go's default of all of it, and then puts back
 // what was set; a GOGC the user set lower, or off, is kept. The usage
 // page's read of the whole history holds every row of it at once (~270 MB
 // live for 390k calls), and a cold start that rests at ~200 MB peaked at
-// 555–587 MB in Activity Monitor there; under it, 410–438 MB. That read
+// 555–587 MB in Activity Monitor there; under a quarter, 410–438 MB. That read
 // and Codex's effort, which reads the whole ledger again while the page
 // still holds its rows, run under it: the warm-up as a whole did too for
 // ~11 s more CPU.
@@ -707,7 +784,7 @@ func underTightGC(fn func()) {
 
 // tightGC is what the reads under a tight GC hold: the first to begin sets
 // it, and the last to end puts back what was set before it. Each read
-// putting back what it found let two at once leave GOGC at 25 for good,
+// putting back what it found let two at once leave GOGC tight for good,
 // when the first to begin ended before the second.
 var tightGC struct {
 	sync.Mutex
@@ -736,7 +813,37 @@ func tightenGC() (undo func()) {
 	})
 }
 
-const tightGCPercent = 25
+// tightGCPercent is a tenth. Under a quarter, a first start's footprint
+// peaked at 390–397 MB, and a start with its caches at 304–321 MB, on a
+// live heap of ~280 MB and ~250 MB: each read, and the window's polls
+// beside it, let the heap grow by ~70 MB first. Under a tenth, 350–352
+// MB and 271–275 MB, for ~20% more CPU in the first start's minute and
+// ~2 s a minute of polls asking ten answers every 5 s (#2278).
+const tightGCPercent = 10
+
+// agentCommand is the shell line that starts a: its Launch where it has
+// one (agy, Claude Science, Cursor Private Inference), else its own
+// program, quoted; "" for one in a WSL distro or with no program here (a
+// desktop app). Nothing of the page's goes into it.
+func agentCommand(a *agent.Agent) string {
+	if a.WSL != "" {
+		return ""
+	}
+	if a.Launch != nil {
+		if run := a.Launch(); run != "" {
+			return run
+		}
+	}
+	if bin := a.BinPath(); bin != "" {
+		return shellQuote(bin)
+	}
+	return ""
+}
+
+// agentTerminal is openTerminal, a var so a test opens no terminal.
+var agentTerminal = openTerminal
+
+func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
 // openTerminal runs a command in the chosen Mac terminal through a .command
 // file, as it would open from Finder: no Automation consent.
@@ -788,5 +895,55 @@ func viaOf(x usage.ViaIndex, s sessions.Session) []usage.Via {
 			return v
 		}
 	}
+	return nil
+}
+
+// statsAnswer writes the stats answer into b as an Encoder of
+// struct{ sessions.Stats; Agents } does, its days one at a time: encoded
+// whole, the Encoder's own buffer grew to the ~6 MB answer from nothing
+// after each collection, ~200 MB of 90 s of polls while an agent worked
+// (#2278).
+func statsAnswer(b *bytes.Buffer, st sessions.Stats, agents map[string]string) error {
+	enc := json.NewEncoder(b)
+	// v as Marshal writes it: Encode ends it with a newline
+	put := func(v any) error {
+		if err := enc.Encode(v); err != nil {
+			return err
+		}
+		b.Truncate(b.Len() - 1)
+		return nil
+	}
+	b.WriteString(`{"from":`)
+	if err := put(st.From); err != nil {
+		return err
+	}
+	b.WriteString(`,"to":`)
+	if err := put(st.To); err != nil {
+		return err
+	}
+	b.WriteString(`,"days":`)
+	if st.Days == nil {
+		b.WriteString("null")
+	} else {
+		b.WriteByte('[')
+		for i := range st.Days {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			if err := put(&st.Days[i]); err != nil {
+				return err
+			}
+		}
+		b.WriteByte(']')
+	}
+	b.WriteString(`,"keys":`)
+	if err := put(st.Keys); err != nil {
+		return err
+	}
+	b.WriteString(`,"agents":`)
+	if err := put(agents); err != nil {
+		return err
+	}
+	b.WriteString("}\n")
 	return nil
 }

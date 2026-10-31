@@ -945,20 +945,28 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 	// Claude's blocks magpie gave Codex (claudeseal) are Claude's alone:
 	// to OpenAI each item is its summary, as before magpie carried them
 	body = withoutClaudeSeals(body)
+	base := provider.CodexBase
+	if apiKey(r.Header) && rest != "/models" {
+		base = codexAPIBase
+	}
 	var maskedHits maskHits
-	if r.Method == http.MethodPost {
+	// the ChatGPT sign-in the user set to go unmasked, and its fallbacks
+	// (codexFallBack masks for its own route), gets the turn as written
+	// (isee1_1 on Discord); Codex's own API key is no account of magpie's
+	sentWhole := base == provider.CodexBase && codexRouteUnmasked(on)
+	if r.Method == http.MethodPost && !sentWhole {
 		var unmask func()
 		var err error
-		w, body, unmask, maskedHits, err = redactedHits(r.Context(), w, body)
+		to := provider.Provider{ID: "codex"} // the ChatGPT backend
+		if on != nil {
+			to = *on
+		}
+		w, body, unmask, maskedHits, err = redactedHits(maskedFor(r.Context(), to, false, nil), w, body)
 		defer unmask()
 		if err != nil {
 			writeError(w, provider.Responses, maskStatus(err), err.Error())
 			return
 		}
-	}
-	base := provider.CodexBase
-	if apiKey(r.Header) && rest != "/models" {
-		base = codexAPIBase
 	}
 	if r.Method == http.MethodPost && rest == "/responses" && base == provider.CodexBase {
 		// a replayed web search the request doesn't declare the tool for
@@ -1024,7 +1032,7 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 		if m := noteMasked(r, "chat", maskedHits, sentOf(maskedHits, body), tr.ID, "openai", model); m != nil {
 			s.trace.update(tr, func(t *Route) { t.Masked = m })
 		}
-		promptRead := s.inspectPrompt(tr, provider.Responses, body, body, false)
+		promptRead := s.inspectPrompt(tr, provider.Responses, body, body, sentWhole)
 		end = func(status int, msg string, tokens, out int) {
 			ms := time.Since(start).Milliseconds()
 			ttft, text := first.ms()
@@ -1451,6 +1459,7 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 	call.TTFT, call.FirstText = first.ms()
 	call.ReasoningHidden = first.hidesReasoning(provider.Responses)
 	uu.add(sniff.usage())
+	uu.Tier = servedTierAt(provider.HostOf(base), uu.Tier)
 	call.Flow = first.flowFor(uu.Reasoning)
 	call.Usage, served = uu, uu.Served
 	errType := ""
@@ -1495,6 +1504,21 @@ func codexBusy(status int, msg []byte) bool {
 		return false
 	}
 	return busy(status, msg)
+}
+
+// codexRouteUnmasked says a turn relayed to the ChatGPT backend on the
+// account on, or on Codex's own sign-in (the codex subscription) when on
+// is nil, goes there as written: the user set that subscription to go
+// unmasked, and every fallback of it too (unredactedRoute).
+func codexRouteUnmasked(on *provider.Provider) bool {
+	if on != nil {
+		return unredactedRoute(*on, false, nil)
+	}
+	p, err := provider.Find("codex")
+	if err != nil || p.Account == nil || p.Account.Agent != "codex" {
+		return false
+	}
+	return unredactedRoute(*p, false, nil)
 }
 
 // codexFallsBack says Codex's turn on one of its own models has fallbacks

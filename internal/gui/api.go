@@ -243,6 +243,9 @@ type agentJSON struct {
 	// another agent offers it again where magpie knows how
 	CLIMissing bool               `json:"cliMissing,omitempty"`
 	Native     *agent.NativeState `json:"native,omitempty"`
+	// Terminal: a Mac's row menu offers Open in terminal, a command
+	// starting it being here (agentCommand)
+	Terminal bool `json:"terminal,omitempty"`
 }
 
 // clientJSON is an agent, or another client the gateway knows, as a
@@ -373,6 +376,9 @@ type settingsJSON struct {
 	// Builtins are the built-in plugins: each one's switch, whether it
 	// runs and what of it is in use (builtins.go)
 	Builtins []builtinJSON `json:"builtins"`
+	// PanelKeys is whether the quick panel's shortcut can be set here
+	// (panelkey.go)
+	PanelKeys panelKeysJSON `json:"panelKeys"`
 	// JSRoutings are the routings JS gateway plugins serve now
 	// ("<plugin>/<name>"), for the routing pickers
 	JSRoutings []middleware.Routing `json:"jsRoutings"`
@@ -511,6 +517,15 @@ type settingsJSON struct {
 	// its share) out of the config at the last sync: too old for it
 	// (before 0.163.0-alpha.8), or of no known version (codex_async.go)
 	CodexAsyncHeld []agent.CodexReader `json:"codexAsyncHeld,omitempty"`
+	// the keys this machine's Codex config has that Codex reads before
+	// Long conversations (model_context_window,
+	// model_auto_compact_token_limit; agent.CodexCompactHeld), written
+	// as the row names them: "[profiles.p] key = value, ..."
+	CodexCompactKeys string `json:"codexCompactKeys,omitempty"`
+	// the magpie model Codex's config runs, when its own window is no
+	// larger than Long conversations' threshold: Codex compacts it at 90%
+	// of that window (codexWindowUnder)
+	CodexWindow *codexRunWindow `json:"codexWindow,omitempty"`
 	// whether a WorkBuddy (China) account is signed in, and each one's
 	// last daily check-in
 	WorkBuddy         bool                        `json:"workbuddy"`
@@ -636,10 +651,66 @@ type searchFailedJSON struct {
 // it. A var for the tests: the real one asks the user's own system.
 var loginState = autostart.Enabled
 
+// codexRunWindow is a model and the window magpie tells Codex it has.
+type codexRunWindow struct {
+	Model  string `json:"model"`
+	Window int    `json:"window"`
+	// Size is Window as the page writes a window (contextsText): 128K, 1M;
+	// "n" is its slot in the row's words, which take the struct whole
+	Size string `json:"n"`
+}
+
+func tokensSize(n int) string {
+	switch {
+	case n%1_000_000 == 0:
+		return strconv.Itoa(n/1_000_000) + "M"
+	case n%1000 == 0:
+		return strconv.Itoa(n/1000) + "K"
+	}
+	return strconv.Itoa(n)
+}
+
+// codexKeysText names Codex's config keys as the Long conversations row
+// shows them, each with its profile and value.
+func codexKeysText(hs []agent.CodexCompactHold) string {
+	var b []string
+	for _, h := range hs {
+		k := h.Key + " = " + h.Value
+		if h.Profile != "" {
+			k = "[profiles." + h.Profile + "] " + k
+		}
+		b = append(b, k)
+	}
+	return strings.Join(b, ", ")
+}
+
+// codexWindowUnder is model's window when Long conversations' threshold
+// doesn't come below it, so Codex compacts at 90% of the window instead
+// (zgjfjfl on Discord, 10-31: a relay's gpt-6-A at 128K, Long
+// conversations at 544K, compacting near 128K). Under Full window, or
+// with a threshold set on the model or its provider, it is nil: the row
+// says what the user chose. A provider's model is looked up at its
+// provider alone (ServedEntryOf), a group in the catalog, since this is
+// read on every settings read.
+func codexWindowUnder(st settings.Settings, model string) *codexRunWindow {
+	if model == "" || st.FullContext {
+		return nil
+	}
+	e, ok := provider.ServedEntryOf(model)
+	if !ok && strings.HasPrefix(model, provider.GroupPrefix) {
+		e, ok = provider.EntryOf(model)
+	}
+	if !ok || e.Context <= 0 || provider.CompactFor(st, e, provider.GroupFinder()) > 0 || st.Working(e.Context) < e.Context {
+		return nil
+	}
+	return &codexRunWindow{Model: model, Window: e.Context, Size: tokensSize(e.Context)}
+}
+
 func settingsState() settingsJSON {
 	s := settingsJSON{Settings: settings.Load(), Version: Version, Dir: tilde(settings.Dir()), Portable: settings.Portable() != "", Gateway: gateway.URL()}
 	s.AddrEnv = os.Getenv("MAGPIE_ADDR")
 	s.Builtins = builtinsState()
+	s.PanelKeys = panelKeysState()
 	s.JSRoutings = middleware.Routings()
 	s.OnNetwork = gateway.OnNetwork()
 	if list, env := gateway.AllowIPs(); env {
@@ -689,6 +760,8 @@ func settingsState() settingsJSON {
 	s.CodexWarmed, s.ClaudeWarmed = latest(provider.CodexWarmed()), latest(provider.ClaudeWarmed())
 	s.CodexUsers, s.ClaudeUsers = loginUsers("codex"), loginUsers("claude")
 	s.CodexAsyncHeld = agent.CodexAsyncHeld()
+	s.CodexCompactKeys = codexKeysText(agent.CodexCompactHeld(""))
+	s.CodexWindow = codexWindowUnder(s.Settings, agent.CodexModel(""))
 	s.WorkBuddy, s.WorkBuddyCheckins = provider.HasWorkBuddy(), provider.WorkBuddyCheckins()
 	s.Trae, s.TraeCheckins = provider.HasTrae(), provider.TraeCheckins()
 	s.MiniMax, s.MiniMaxCheckins = provider.HasMiniMax(), provider.MiniMaxCheckins()
@@ -1351,7 +1424,7 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 			in.MaskAlert = cur.MaskAlert
 		}
 		in.AgentOrder, in.AgentsHidden, in.AgentsShown = cur.AgentOrder, cur.AgentsHidden, cur.AgentsShown
-		in.Window, in.WindowMaximised = cur.Window, cur.WindowMaximised // the window's own, as it was last resized
+		in.Window, in.WindowMaximised, in.WindowAt = cur.Window, cur.WindowMaximised, cur.WindowAt // the window's own, as it was last resized and moved
 		// and what other pages keep here: which models an agent is shown, and
 		// everything the user said of a model anywhere else in the app, set on
 		// its own. The per-model maps are carried whole rather than named one
@@ -1436,15 +1509,19 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		in.RedactRouteTo = cur.RedactRouteTo
 		in.DesktopSubagentEffort = cur.DesktopSubagentEffort
 		in.ChinaMirror = cur.ChinaMirror // the Plugins page's, set on its own
+		in.NPMRegistry = cur.NPMRegistry // and its npm registry
 		// which Codex accounts spend a reset by themselves, set on the Usage card
 		in.CodexAutoReset = cur.CodexAutoReset
 		in.CodexAutoResetOnly = cur.CodexAutoResetOnly // and at which of the two times
+		in.CodexResetLead = cur.CodexResetLead         // and how early before one expires (codex-reset-lead)
 		// and which of them spend their credits, set there too
 		in.CodexNoCredits = cur.CodexNoCredits
 		// and each Codex account's own daily warm-up (codex-warm-at below)
 		in.CodexWarmAtOf = cur.CodexWarmAtOf
 		// and the text size, which the keyboard changes too (text-size below)
 		in.TextSize = cur.TextSize
+		// and the quick panel's shortcut, set on its own (panel-shortcut below)
+		in.PanelShortcut = cur.PanelShortcut
 		// the Dock choice's reading, which the page never sets: the file's
 		// as read (settings.DockSettled), so a save from the page doesn't
 		// read its With window as an older file's Hide
@@ -1492,10 +1569,11 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		}
 		// the cards the menu bar shows, any of them (TrayUsage is only the first),
 		// how often, with their logos or not, beside the bird or not, and
-		// with their Pace numbers or not, with magpie's totals' cost or not
+		// with their Pace numbers or not, with magpie's totals' cost or not, and
+		// which of each subscription's windows
 		if (!slices.Equal(settings.Load().TrayUsages, cur.TrayUsages) || in.TrayUsageEvery != cur.TrayUsageEvery ||
 			in.TrayNoLogos != cur.TrayNoLogos || in.TrayNoBird != cur.TrayNoBird || in.TrayPace != cur.TrayPace ||
-			in.TrayNoCost != cur.TrayNoCost) && onTrayUsage != nil {
+			in.TrayNoCost != cur.TrayNoCost || !maps.EqualFunc(in.TrayWindows, cur.TrayWindows, slices.Equal)) && onTrayUsage != nil {
 			onTrayUsage()
 		}
 		// an alert turned on or moved is looked at now, the Mac asked for its
@@ -1705,6 +1783,15 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 			err = provider.SetCompactAt(*in.At)
 		}
 		if err != nil {
+			fail(rw, err)
+			return
+		}
+		writeJSON(rw, settingsState())
+	})
+	// takes out of Codex's config the keys it reads before Long
+	// conversations (agent.CodexCompactHeld), on the user's click
+	mux.HandleFunc("POST /api/settings/codex-compact-held/drop", func(rw http.ResponseWriter, r *http.Request) {
+		if err := agent.DropCodexCompactHolds(""); err != nil {
 			fail(rw, err)
 			return
 		}
@@ -1921,6 +2008,20 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		}
 		writeJSON(rw, settingsState())
 	})
+	// how long before a Codex reset about to run out unused it is spent,
+	// for every account with "before one expires" on; 0 is the default
+	mux.HandleFunc("POST /api/settings/codex-reset-lead", func(rw http.ResponseWriter, r *http.Request) {
+		var in struct{ Minutes int }
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			fail(rw, err)
+			return
+		}
+		if err := provider.SetCodexResetLead(in.Minutes); err != nil {
+			fail(rw, err)
+			return
+		}
+		writeJSON(rw, settingsState())
+	})
 	// whether a Codex account spends its credits once its allowance is
 	// used up, the Usage card's toggle, set on its own
 	mux.HandleFunc("POST /api/settings/codex-credits", func(rw http.ResponseWriter, r *http.Request) {
@@ -2113,6 +2214,41 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		}
 		if w != nil {
 			w.SetTextSize(in.Size)
+		}
+		writeJSON(rw, settingsState())
+	})
+	// the quick panel's shortcut (panelkey.go): bound in the app first, so
+	// one the system refuses is said and not saved, the one before kept
+	mux.HandleFunc("POST /api/settings/panel-shortcut", func(rw http.ResponseWriter, r *http.Request) {
+		var in struct{ Shortcut string }
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			fail(rw, err)
+			return
+		}
+		key, err := panelShortcut(in.Shortcut, runtime.GOOS)
+		if err != nil {
+			fail(rw, err)
+			return
+		}
+		s := settings.Load()
+		if key != "" && !panelKeysState().Can {
+			fail(rw, errors.New("This desktop doesn't let apps take a shortcut"))
+			return
+		}
+		if onPanelShortcut != nil {
+			if err := onPanelShortcut(key); err != nil {
+				fail(rw, err)
+				return
+			}
+		}
+		was := s.PanelShortcut
+		s.PanelShortcut = key
+		if err := settings.Save(s); err != nil {
+			if onPanelShortcut != nil {
+				_ = onPanelShortcut(was) // the saved one bound again
+			}
+			fail(rw, err)
+			return
 		}
 		writeJSON(rw, settingsState())
 	})
@@ -2568,7 +2704,7 @@ func held(h http.Handler) http.Handler {
 			defer sessions.Ask()()
 			// and what the read threw away goes back once the page rests
 			defer readingPage()()
-			// and collected under GOGC 25 while it runs: a poll's reads
+			// and collected under GOGC 10 while it runs: a poll's reads
 			// allocated ~330 MB to keep ~105 MB, and at the default 100 the
 			// heap grew to twice what it kept before a collection, ~320 MB
 			// in Activity Monitor during a poll. No memory limit: held as
@@ -2645,6 +2781,8 @@ func state() stateJSON {
 			aj.Typed = a.Typed()
 		}
 		aj.CLIMissing = a.CLIMissing()
+		// as agentCommand makes it, Launch asked once
+		aj.Terminal = runtime.GOOS == "darwin" && a.WSL == "" && (aj.Launch != "" || a.BinPath() != "")
 		if a.Native != nil {
 			native := a.Native.Read()
 			aj.Native = &native
@@ -2671,6 +2809,23 @@ func state() stateJSON {
 type signInOpened struct {
 	provider.SignInState
 	OpenError string `json:"openError,omitempty"`
+	// LinkOnly is a sign-in whose page magpie didn't open, as the user
+	// asked (settings.SignInLinkOnly): the window says to copy its link
+	LinkOnly bool `json:"linkOnly,omitempty"`
+}
+
+// openSignIn opens an account sign-in's page, unless the user keeps those
+// pages to a browser of their own (settings.SignInLinkOnly), and says how
+// it went for signInOpened.
+func openSignIn(w Windows, st provider.SignInState) signInOpened {
+	if settings.Load().SignInLinkOnly {
+		return signInOpened{SignInState: st, LinkOnly: true}
+	}
+	var failed string
+	if w != nil && !st.Opened {
+		failed = openError(w, st.URL)
+	}
+	return signInOpened{SignInState: st, OpenError: failed}
 }
 
 // mcpSignInOpened is signInOpened for a sign-in to an MCP server.
@@ -2705,8 +2860,15 @@ func writeJSON(rw http.ResponseWriter, v any) {
 // WebView2 is sent no If-None-Match, and Wails turns its 304 into a 505.
 // It returns the tag, or "" when v could not be written.
 func writeJSONSame(rw http.ResponseWriter, r *http.Request, v any) string {
-	var b bytes.Buffer
-	if err := json.NewEncoder(&b).Encode(v); err != nil {
+	return writeSame(rw, r, func(b *bytes.Buffer) error { return json.NewEncoder(b).Encode(v) })
+}
+
+// writeSame is writeJSONSame of the answer write puts in b, a kept buffer
+// (answerBuffer).
+func writeSame(rw http.ResponseWriter, r *http.Request, write func(b *bytes.Buffer) error) string {
+	b := answerBuffer()
+	defer keepAnswer(b)
+	if err := write(b); err != nil {
 		fail(rw, err)
 		return ""
 	}
@@ -2734,6 +2896,52 @@ var sentRows struct {
 
 const sentRowsKept = 4
 
+// answerBuffers are the buffers a long answer is written in, kept between
+// polls: grown from nothing for each, the Sessions tab's list and its
+// stats, ~6 MB each, were ~110 MB of 90 s of polls while an agent worked
+// (#2278). They go answerLinger after the last answer.
+var answerBuffers struct {
+	sync.Mutex
+	free []*bytes.Buffer
+	t    *time.Timer
+}
+
+const answerBuffersKept = 2
+
+var answerLinger = 30 * time.Second
+
+// answerBuffer is a kept buffer, empty, or a new one
+func answerBuffer() *bytes.Buffer {
+	answerBuffers.Lock()
+	defer answerBuffers.Unlock()
+	if n := len(answerBuffers.free); n > 0 {
+		b := answerBuffers.free[n-1]
+		answerBuffers.free = answerBuffers.free[:n-1]
+		return b
+	}
+	return new(bytes.Buffer)
+}
+
+// keepAnswer puts b back once its answer is written: nothing reads it
+// after, a ResponseWriter copies what it is given.
+func keepAnswer(b *bytes.Buffer) {
+	b.Reset()
+	answerBuffers.Lock()
+	defer answerBuffers.Unlock()
+	if len(answerBuffers.free) < answerBuffersKept {
+		answerBuffers.free = append(answerBuffers.free, b)
+	}
+	if answerBuffers.t == nil {
+		answerBuffers.t = time.AfterFunc(answerLinger, func() {
+			answerBuffers.Lock()
+			answerBuffers.free = nil
+			answerBuffers.Unlock()
+		})
+		return
+	}
+	answerBuffers.t.Reset(answerLinger)
+}
+
 // rowsSize is the size of the last answer writeJSONRows wrote of each key,
 // what the next one's buffer is made for.
 var rowsSize sync.Map
@@ -2755,14 +2963,15 @@ func writeJSONRows[T any](rw http.ResponseWriter, r *http.Request, key string, r
 	// the rows are written once, into the answer itself: each row's
 	// Marshal, their Join and the answer's buffer were three copies of the
 	// ~8 MB list a poll, and the buffer grew to it from nothing
-	var whole bytes.Buffer
+	whole := answerBuffer()
+	defer keepAnswer(whole)
 	if n, ok := rowsSize.Load(key); ok {
 		whole.Grow(n.(int) + n.(int)/8)
 	}
 	whole.WriteByte('{')
 	whole.Write(k)
 	whole.WriteString(":[")
-	enc := json.NewEncoder(&whole)
+	enc := json.NewEncoder(whole)
 	ends := make([]int, len(rows)+1)
 	ends[0] = whole.Len()
 	for i := range rows {
@@ -2787,7 +2996,7 @@ func writeJSONRows[T any](rw http.ResponseWriter, r *http.Request, key string, r
 		}
 		b.WriteByte('\n')
 	}
-	end(&whole)
+	end(whole)
 	rowsSize.Store(key, whole.Len())
 	all := whole.Bytes()
 	raw := make([][]byte, len(rows))
