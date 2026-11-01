@@ -57,6 +57,7 @@ func (h *host) makeMain(url string) *application.WebviewWindow {
 		BackgroundColour: winBg,
 	})
 	h.zoomWhenLoaded(w)
+	lowWhileHidden(w)
 	if runtime.GOOS == "windows" {
 		w.OnWindowEvent(events.Common.WindowRuntimeReady, func(*application.WindowEvent) { w.ExecJS(frameOnlyResizeJS) })
 	}
@@ -128,6 +129,7 @@ func (h *host) makePanel() *application.WebviewWindow {
 	po.Width, po.Height, po.Zoom = h.panelW(), cmp.Or(h.panelHeight, zoomed(panelStart, z)), z
 	w := h.app.Window.NewWithOptions(po)
 	h.zoomWhenLoaded(w)
+	lowWhileHidden(w)
 	if h.tray != nil {
 		h.tray.AttachWindow(w).WindowOffset(6)
 	}
@@ -145,7 +147,7 @@ func (h *host) makePanel() *application.WebviewWindow {
 			return
 		}
 		e.Cancel()
-		w.Hide()
+		hideWebview(w)
 		if omarchy.Hyprland() {
 			go omarchy.StopClicks()
 		}
@@ -273,10 +275,10 @@ func (h *host) mainShown() bool { return h.main != nil && windowUp(h.main) }
 // if lightweight mode let it go; on the main thread.
 func (h *host) openMain(url string) {
 	h.closing.Store(false) // opened again while leaving full screen: it stays
-	if h.panel != nil {
-		h.panel.Hide()
-	}
-	h.dock(settings.Load(), true)
+	hideWebview(h.panel)
+	// the window a restart by itself brings back: up, not in front
+	quiet := quietShow.Swap(false)
+	h.dockFront(settings.Load(), true, !quiet)
 	if h.main == nil {
 		w := h.makeMain(cmp.Or(url, "/?"+h.query))
 		h.main = w
@@ -284,7 +286,7 @@ func (h *host) openMain(url string) {
 		h.whenLoaded(w, func() {
 			if h.main == w {
 				h.placeMain(w)
-				showHere(w)
+				showHere(w, !quiet)
 			}
 		})
 		return
@@ -296,7 +298,7 @@ func (h *host) openMain(url string) {
 		return // made again, it is shown once its page has come
 	}
 	h.placeMain(h.main)
-	showHere(h.main)
+	showHere(h.main, !quiet)
 }
 
 // reopenMain answers a click on magpie's Dock icon (#1252). A window that is
@@ -309,9 +311,7 @@ func (h *host) reopenMain() {
 		return
 	}
 	h.closing.Store(false) // reopened while leaving full screen: it stays
-	if h.panel != nil {
-		h.panel.Hide()
-	}
+	hideWebview(h.panel)
 	activateApp()
 }
 
@@ -323,11 +323,14 @@ const spaceSettle = 500 * time.Millisecond
 // showHere shows w and makes it key on the Space the user is on, wherever it
 // was last; on the main thread. It moves only while being shown: left on,
 // activating magpie in any way (the Dock, Command-Tab) would pull the open
-// window off its own Space onto the user's (#1252).
-func showHere(w *application.WebviewWindow) {
+// window off its own Space onto the user's (#1252). Without focus, it is
+// shown and left behind the app the user is in (a restart by itself).
+func showHere(w *application.WebviewWindow, focus bool) {
 	setMovesToActiveSpace(w, true)
-	w.Show()
-	w.Focus()
+	showWebview(w)
+	if focus {
+		w.Focus()
+	}
 	time.AfterFunc(spaceSettle, func() {
 		application.InvokeAsync(func() { setMovesToActiveSpace(w, false) })
 	})

@@ -10,12 +10,12 @@ package settings
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"math"
 	"net/url"
 	"os"
-	"path/filepath"
 	"reflect"
 	"regexp"
 	"runtime"
@@ -208,6 +208,14 @@ type Settings struct {
 	// from wherever (gateway.publicClient). In settings.json only; it names
 	// this computer's own network, so it isn't synced (KeepOwn).
 	FetchPrivate []string `json:"fetchPrivate,omitempty"`
+	// RouterNote is what this computer's MCP router says of itself to the
+	// agents that connect to it (packinggoodsllc_07668 on Discord: two
+	// magpies, one in China and one in Los Angeles, serve the same tools,
+	// and an agent fetching Google should pick the one in Los Angeles):
+	// in its initialize instructions, its serverInfo title, and before each
+	// tool's description (gateway.hubWhere). "" is this computer's name, said
+	// only to an agent on another computer. This computer's own (KeepOwn).
+	RouterNote string `json:"routerNote,omitempty"`
 	// Port is the gateway's port on this computer, 0 for DefaultPort.
 	// MAGPIE_ADDR, where it is set, comes first (GatewayAddr).
 	Port int `json:"port,omitempty"`
@@ -300,6 +308,18 @@ type Settings struct {
 	// groups and fallbacks, where by default the vendor answers on its
 	// credits (see provider.CodexCredits).
 	CodexNoCredits []string `json:"codexNoCredits,omitempty"`
+	// CodexCreditsLast are the ChatGPT accounts (lower-case) that spend
+	// their credits only after everything else: once a usage window is
+	// used up, routing tries the account after every account, key and
+	// fallback not on its credits, instead of in its place. Not one of
+	// CodexNoCredits: an account set not to spend them is held.
+	CodexCreditsLast []string `json:"codexCreditsLast,omitempty"`
+	// CodexCreditsFirst are the ChatGPT accounts (lower-case) that spend
+	// their credits before routing moves to another account: a window used
+	// up doesn't send requests or Codex's sign-in elsewhere while the
+	// account goes on on its credits (jojonas_xyz on X). Not one of
+	// CodexNoCredits nor CodexCreditsLast.
+	CodexCreditsFirst []string `json:"codexCreditsFirst,omitempty"`
 	// WorkBuddyCheckin presses WorkBuddy's daily check-in (签到) for each
 	// signed-in WorkBuddy (China) account once a Beijing day, claiming the
 	// credits it gives while its event runs.
@@ -334,9 +354,14 @@ type Settings struct {
 	CheckinOff []string `json:"checkinOff,omitempty"`
 	// MemberModel has a reply's model name the routing group's member
 	// that answered, as magpie's provider/model id (workbuddy/glm-5.3-flash),
-	// rather than the vendor's own name for it, for agents that count
-	// usage by the reply's model (#822). Claude Code, Claude Desktop and
-	// Codex always get the vendor's name: they read it themselves.
+	// for agents that count usage by the reply's model (#822). Off, as by
+	// default, a reply sent under another name than the one asked for (a
+	// group's member, a model's own id, a provider/model id) names the
+	// model the agent asked for (issennknight on Discord: an agent warned
+	// that deepseek-v4.1-flash came back as deepseek-v4.1-flash-1017);
+	// one the vendor named as asked keeps the vendor's name, a dated one
+	// too. Claude Code, Claude Desktop and Codex never get the member's
+	// id: they read the name themselves (gateway's replyNamingOf).
 	MemberModel bool `json:"memberModel,omitempty"`
 	// NoLoopGuard lets a streamed reply run on when its reasoning or text
 	// is stuck in a loop of the same few lines (#1359). Off, as by
@@ -350,10 +375,14 @@ type Settings struct {
 	// default, the run is the shape every Claude Code run has.
 	ClaudeLeanPrompt bool `json:"claudeLeanPrompt,omitempty"`
 	// ClaudePrintMode runs a Claude subscription's Claude Code as `claude
-	// -p` always. Off, as by default, a run is Claude Code's interactive
-	// mode, as a person runs it, where it can be (macOS and Linux, no
-	// images, safeguards or client cache marks): the plan counts a -p
-	// request at about twice an interactive one.
+	// -p` always. Off, as by default, a model request runs in Claude
+	// Code's interactive mode, as a person runs it, and never as -p: the
+	// plan counts a -p request at about twice an interactive one, and a -p
+	// run starts without the interactive mode's cache. A request it can't
+	// take (safeguards, a JSON schema, …), or one it doesn't start for,
+	// fails saying why. Reading the plan's allowance (/usage, no model
+	// request) is -p either way. (An "Interactive only" claudeTUIOnly,
+	// v0.1.2448, is what Off is now, and is no longer read.)
 	ClaudePrintMode bool `json:"claudePrintMode,omitempty"`
 	// ClaudeRunsMost is how many Claude Code processes a Claude
 	// subscription may have running at once: conversations' runs, those
@@ -455,12 +484,24 @@ type Settings struct {
 	// haiku needed more than 8): from 1 to ClassifyTimeoutMost, 0 for
 	// ClassifyTimeoutDefault. ClassifyWait reads it.
 	ClassifyTimeout int `json:"classifyTimeout,omitempty"`
+	// BusyLoad puts a model whose plugin reports it busier than this
+	// percent behind the others it could go to (plugin.ModelLoad,
+	// axelburks on Discord): from 1 to BusyLoadMost-1, past 100 for a
+	// vendor that queues, 0 for off. A model with no
+	// load reported, or one older than plugin.LoadFresh, keeps its place.
+	BusyLoad int `json:"busyLoad,omitempty"`
 	// Searcher is the provider that searches the web for a model that
 	// can't: "<provider>" with the small model magpie picks of it,
 	// "<provider>/<model>", or empty for the one magpie picks
 	// (gateway.searcher). "off" allows only configured search APIs.
 	// One that is gone, off or can't search gives way to magpie's pick.
 	Searcher string `json:"searcher,omitempty"`
+	// SearcherThen are the searchers asked in turn, in this order, when
+	// the one Searcher names fails or finds nothing, each written as
+	// Searcher is (axelburks on Discord: a second provider when the first
+	// fails). Read only while Searcher names one; magpie's own pick hands
+	// on to the next it would pick by itself.
+	SearcherThen []string `json:"searcherThen,omitempty"`
 	// SearcherEffort is how hard the searcher's model thinks as it searches
 	// (MOMO on Discord): a level of catalog.EffortRank, fitted to the
 	// model's own levels when it is asked, or empty to send none, the
@@ -471,6 +512,12 @@ type Settings struct {
 	// SearchFirstAPI for the search APIs, the provider's search after them
 	// when they fail; empty for the provider first, as before.
 	SearchFirst string `json:"searchFirst,omitempty"`
+	// SearchAll is that magpie searches for every model, one whose
+	// provider searches the web by itself too (cybercaius on Discord):
+	// the client's search is answered by the searcher and the search APIs,
+	// as for a model that can't, and the provider is sent no search tool.
+	// Only while magpie can search for it (gateway.magpieSearches).
+	SearchAll bool `json:"searchAll,omitempty"`
 	// TrayUsages are the subscriptions and plans whose windows are shown
 	// beside the tray icon, in the order shown, each by its provider and
 	// account ("claude|a@b.c"); none when empty.
@@ -846,6 +893,17 @@ type Settings struct {
 	// the routing groups, the usage records and what a call is priced at —
 	// keeps the name magpie knows the model by.
 	ModelWires map[string]string `json:"modelWires,omitempty"`
+	// ModelIDs are the ids the user lists a provider's models by, from
+	// "<provider id>/<the id magpie lists it by>" to the id the provider
+	// itself serves it under (zeewell on X: deepseek-v4.1-flash-1017 known
+	// as deepseek-v4.1-flash). The model is listed, picked, grouped, found
+	// in routing groups, limited by gateway keys and recorded in usage by
+	// that id, and a request for it goes out under the provider's own, as
+	// a ModelWires name does (Wires). Keyed by the id it is known by, so one
+	// id of a provider is one of its models; a model of the provider's own
+	// with that id is not listed while another goes by it. Absent leaves
+	// each model to the provider's id (provider.SetModelID).
+	ModelIDs map[string]string `json:"modelIDs,omitempty"`
 	// ModelAPIs is the one API a model is asked on at its provider, by
 	// "<provider id>/<model id>": chat, responses or anthropic, for a relay
 	// whose one key serves some models on one and others on another
@@ -1076,6 +1134,10 @@ func (s Settings) ResetLead() time.Duration {
 	return time.Duration(m) * time.Minute
 }
 
+// BusyLoadMost is past the highest BusyLoad: plugin.LoadMost, the most a
+// plugin's reported load is kept at, so a threshold at it moves nothing.
+const BusyLoadMost = 10000
+
 // ClassifyTimeoutDefault is the seconds a classifier is given when
 // ClassifyTimeout is 0, and ClassifyTimeoutMost the most it can be set to:
 // the turn waits on it before it goes anywhere, with nothing sent to its
@@ -1240,9 +1302,9 @@ func (s Settings) Compact() int {
 // KeepOwn puts back cur's settings that are this computer's own, which a
 // sync or a restored backup never brings from another: the window's size,
 // place and whether it was maximised, the proxy, the gateway's port, whether it
-// is shared on the local network and the addresses let in to it, the
-// Dock, gateway mode, whether WSL is looked in, whether agents' sign-ins
-// are read, when allowances are read, the terminal app a session resumes
+// is shared on the local network and the addresses let in to it, what
+// its MCP router says of itself, the Dock, gateway mode, whether WSL is
+// looked in, whether agents' sign-ins are read, when allowances are read, the terminal app a session resumes
 // in, the quick panel's shortcut, whether the local masking model is on
 // (it is downloaded on this computer alone), how many Claude Code processes may run (its memory),
 // and what the menu bar or tray shows beside magpie's icon (yoooo on
@@ -1264,6 +1326,7 @@ func (s *Settings) KeepOwn(cur Settings) {
 	s.QuotaReads = cur.QuotaReads
 	s.NoAccountDiscovery = cur.NoAccountDiscovery
 	s.LAN, s.AllowIPs = cur.LAN, cur.AllowIPs
+	s.RouterNote = cur.RouterNote
 	s.FetchPrivate = cur.FetchPrivate
 	s.SessionTerminal = cur.SessionTerminal
 	s.PanelShortcut = cur.PanelShortcut
@@ -1271,6 +1334,70 @@ func (s *Settings) KeepOwn(cur Settings) {
 	s.RedactModelOff, s.RedactModelAuto = cur.RedactModelOff, cur.RedactModelAuto
 	s.ClaudeRunsMost = cur.ClaudeRunsMost
 	s.RequestArchiveLocal, s.RequestArchiveLocalMB = cur.RequestArchiveLocal, cur.RequestArchiveLocalMB
+}
+
+// Wires is ModelWires with the provider's own id of each model the user
+// lists by another (ModelIDs): what a request for "<provider>/<id>" goes out
+// under. A name the user gave the model itself in ModelWires is kept, and a
+// provider's "*" name is the provider's own id in its "*". With no ModelIDs
+// it is ModelWires itself; else it is made again only when either map holds
+// something else than the last time. It is read, never written to.
+func (s Settings) Wires() map[string]string {
+	if len(s.ModelIDs) == 0 {
+		return s.ModelWires
+	}
+	wiresMemo.Lock()
+	defer wiresMemo.Unlock()
+	if wiresMemo.out != nil && maps.Equal(wiresMemo.ids, s.ModelIDs) && maps.Equal(wiresMemo.wires, s.ModelWires) {
+		return wiresMemo.out
+	}
+	out := make(map[string]string, len(s.ModelWires)+len(s.ModelIDs))
+	maps.Copy(out, s.ModelWires)
+	for k, own := range s.ModelIDs {
+		pid, _, ok := strings.Cut(k, "/")
+		own = strings.TrimSpace(own)
+		if !ok || own == "" || strings.TrimSpace(s.ModelWires[k]) != "" {
+			continue
+		}
+		if all := strings.TrimSpace(s.ModelWires[pid+"/*"]); all != "" {
+			own = strings.ReplaceAll(all, "*", own)
+		}
+		out[k] = own
+	}
+	wiresMemo.ids, wiresMemo.wires, wiresMemo.out = maps.Clone(s.ModelIDs), maps.Clone(s.ModelWires), out
+	return out
+}
+
+// wiresMemo is the Wires last made, and copies of the two maps it was
+// made of: compared by what they hold, as a caller may change its own
+// settings' maps in place.
+var wiresMemo struct {
+	sync.Mutex
+	ids, wires, out map[string]string
+}
+
+// MoveModel moves what the user said of the model keyed from
+// ("<provider>/<model>") to the key to, in every per-model map but
+// ModelIDs, and says whether anything moved. A map with something under
+// to already keeps it, and what from had there stays where it was: what
+// the user said of the model now keyed to is theirs and is not written
+// over.
+func (s *Settings) MoveModel(from, to string) bool {
+	moved := false
+	PerModelKeys(s, func(name string, m reflect.Value) {
+		if name == "ModelIDs" || m.IsNil() {
+			return
+		}
+		fk, tk := reflect.ValueOf(from).Convert(m.Type().Key()), reflect.ValueOf(to).Convert(m.Type().Key())
+		v := m.MapIndex(fk)
+		if !v.IsValid() || m.MapIndex(tk).IsValid() {
+			return
+		}
+		m.SetMapIndex(fk, reflect.Value{})
+		m.SetMapIndex(tk, v)
+		moved = true
+	})
+	return moved
 }
 
 // RenamePerModel moves what the user said of a provider's models to the id
@@ -1312,7 +1439,7 @@ func renameInMap(m reflect.Value, from, to string) bool {
 }
 
 // Path is the settings file.
-func Path() string { return filepath.Join(Dir(), "settings.json") }
+func Path() string { return appdir.Join(Dir(), "settings.json") }
 
 // Dir is the folder every magpie file lives in: the data folder beside a
 // portable magpie (appdir.Portable), else ~/.config/magpie.
@@ -1387,6 +1514,52 @@ func Shared() Settings {
 	return s
 }
 
+// SharedModelIDs is Shared().ModelIDs, read for each model a list is
+// built of: only that field is parsed, once per change of the file, and a
+// missing file has none without the defaults Shared builds each time.
+// Unreadable or unparsable, it is what Shared says. It is shared: the
+// caller must not change it.
+func SharedModelIDs() map[string]string {
+	fileMu.RLock()
+	ids, err := filememo.Read("settings-model-ids", pathNow(), func(b []byte) (map[string]string, error) {
+		var s struct {
+			ModelIDs map[string]string `json:"modelIDs"`
+		}
+		err := json.Unmarshal(b, &s)
+		return s.ModelIDs, err
+	})
+	fileMu.RUnlock()
+	if err == nil {
+		return ids
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return Shared().ModelIDs
+}
+
+// pathNow is Path, built again only when what it is built from changed:
+// SharedModelIDs is read several times for each list, and Path's joins
+// were most of what building one allocated.
+func pathNow() string {
+	k := pathFrom{appdir.Portable(), os.Getenv("XDG_CONFIG_HOME"), os.Getenv("HOME"), os.Getenv("USERPROFILE")}
+	if m := lastPath.Load(); m != nil && m.from == k {
+		return m.path
+	}
+	path := Path()
+	lastPath.Store(&pathMemo{k, path})
+	return path
+}
+
+type pathFrom struct{ portable, xdg, home, profile string }
+
+type pathMemo struct {
+	from pathFrom
+	path string
+}
+
+var lastPath atomic.Pointer[pathMemo]
+
 // sharedFor is the shared Settings parse keeps for contents b, when it
 // keeps them.
 func sharedFor(b []byte) (Settings, bool) {
@@ -1427,6 +1600,13 @@ func loadChecked() (Settings, error) {
 		return s.settleDock().normal(), fmt.Errorf("could not read settings at %s: %w", Path(), err)
 	}
 	return parse(b)
+}
+
+// Defaults are the settings of a new install, with no settings.json:
+// what `magpie settings list` shows as each one's default, and what
+// `magpie settings reset` puts back.
+func Defaults() Settings {
+	return Settings{DockSettled: true}.normal()
 }
 
 // settleDock reads a Dock choice written before With window was the
@@ -1552,7 +1732,7 @@ func GatewayAddr() string {
 // magpie whose settings these are, which one the variable moves (magpie-dev,
 // a sandbox) runs beside.
 func SavedAddr() string {
-	p := Load().Port
+	p := Shared().Port
 	if p == 0 || CheckPort(p) != nil {
 		p = DefaultPort
 	}
@@ -1617,6 +1797,32 @@ func SetGatewayConversations(on bool) error {
 	return save(s, true)
 }
 
+// RouterNoteMost is how many characters RouterNote keeps: a few words,
+// said before every tool's description.
+const RouterNoteMost = 80
+
+// CleanRouterNote is note as RouterNote keeps it: one line, its spaces
+// collapsed, RouterNoteMost characters at most.
+func CleanRouterNote(note string) string {
+	note = strings.Join(strings.Fields(note), " ")
+	if r := []rune(note); len(r) > RouterNoteMost {
+		note = strings.TrimSpace(string(r[:RouterNoteMost]))
+	}
+	return note
+}
+
+// SetRouterNote sets RouterNote alone, from what the file holds now. A
+// settings file that can't be read is left as it is, with the error.
+func SetRouterNote(note string) error {
+	defer lockFile()()
+	s, err := loadChecked()
+	if err != nil {
+		return err
+	}
+	s.RouterNote = CleanRouterNote(note)
+	return save(s, true)
+}
+
 // EditCheckinOff changes CheckinOff alone, as edit returns it from what the
 // file holds now, so a save elsewhere from an older snapshot isn't undone.
 // A settings file that can't be read is left as it is, with the error.
@@ -1653,6 +1859,36 @@ func EditUsageAliases(edit func(map[string]string) (map[string]string, error)) e
 		m = nil
 	}
 	s.UsageAliases = m
+	return save(s, false)
+}
+
+// EditPluginOptions changes PluginOptions alone, as edit returns them from
+// what the file holds now (provider id → option key → on), as
+// EditUsageAliases does. edit is given a deep copy; an error from it, or a
+// settings file that can't be read, saves nothing.
+func EditPluginOptions(edit func(map[string]map[string]bool) (map[string]map[string]bool, error)) error {
+	defer lockFile()()
+	s, err := loadChecked()
+	if err != nil {
+		return err
+	}
+	cp := make(map[string]map[string]bool, len(s.PluginOptions))
+	for id, o := range s.PluginOptions {
+		cp[id] = maps.Clone(o)
+	}
+	m, err := edit(cp)
+	if err != nil {
+		return err
+	}
+	for id, o := range m {
+		if len(o) == 0 {
+			delete(m, id)
+		}
+	}
+	if len(m) == 0 {
+		m = nil
+	}
+	s.PluginOptions = m
 	return save(s, false)
 }
 
@@ -1785,6 +2021,9 @@ func saveOwn(s Settings, recording, reads bool) error {
 	if s.ClassifyTimeout < 0 || s.ClassifyTimeout > ClassifyTimeoutMost {
 		return fmt.Errorf("a routing group's classifier is given from 1 to %d seconds, or 0 for %d, not %d", ClassifyTimeoutMost, ClassifyTimeoutDefault, s.ClassifyTimeout)
 	}
+	if s.BusyLoad < 0 || s.BusyLoad >= BusyLoadMost {
+		return fmt.Errorf("busy models go last over a load from 1 to %d%%, or 0 for off, not %d", BusyLoadMost-1, s.BusyLoad)
+	}
 	if s.UsageAlert < 0 || s.UsageAlert > 100 {
 		return fmt.Errorf("a usage alert is at a percentage from 1 to 100, or 0 for off, not %d", s.UsageAlert)
 	}
@@ -1854,6 +2093,13 @@ func saveOwn(s Settings, recording, reads bool) error {
 		return fmt.Errorf("%q is not a reasoning effort for Claude Desktop's subagents", e)
 	}
 	s.Searcher = strings.TrimSpace(s.Searcher)
+	var then []string
+	for _, v := range s.SearcherThen {
+		if v = strings.TrimSpace(v); v != "" && v != "off" && v != s.Searcher && !slices.Contains(then, v) {
+			then = append(then, v)
+		}
+	}
+	s.SearcherThen = then
 	for _, e := range []*string{&s.VisionEffort, &s.SearcherEffort} {
 		if *e = strings.ToLower(strings.TrimSpace(*e)); *e != "" && !slices.Contains(catalog.EffortRank, *e) {
 			return fmt.Errorf("a model's reasoning must be one of %s, or empty for the default, not %q", strings.Join(catalog.EffortRank, ", "), *e)
@@ -1907,6 +2153,14 @@ func saveOwn(s Settings, recording, reads bool) error {
 		s.CodexNoCredits[i] = strings.ToLower(u)
 	}
 	s.CodexNoCredits = ids(s.CodexNoCredits)
+	for i, u := range s.CodexCreditsLast {
+		s.CodexCreditsLast[i] = strings.ToLower(u)
+	}
+	s.CodexCreditsLast = ids(s.CodexCreditsLast)
+	for i, u := range s.CodexCreditsFirst {
+		s.CodexCreditsFirst[i] = strings.ToLower(u)
+	}
+	s.CodexCreditsFirst = ids(s.CodexCreditsFirst)
 	s.TrayUsage = ""
 	if len(s.TrayUsages) > 0 {
 		s.TrayUsage = s.TrayUsages[0]

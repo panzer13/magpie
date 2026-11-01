@@ -157,7 +157,7 @@ func (ps *pairedRows) heatOf(since, now time.Time, f Filter, cache *partCache, i
 // chunks of ps that only keeps (nil: all).
 func (ps *pairedRows) heatDaysOf(since, now time.Time, f Filter, cache *partCache, identities map[string]sessions.CodexIdentity, only func(*rowChunk) bool) []Day {
 	sigs := ps.sigs(identities)
-	var rows chunkRows
+	rows := lentRows() // a day keeps its date and numbers
 	defer rows.release()
 	var r Row
 	all := heatDays{}
@@ -454,7 +454,7 @@ func heatAdvance(d heatDiskRef, cut, since, now time.Time, f Filter, identities 
 	return days, true
 }
 
-// heatCold is the days from since to cut, of a pairing a few weeks at a
+// heatCold is the days from since to cut, of a pairing a few days at a
 // time (coldSpans), written under key; or false.
 func heatCold(cut, since, now time.Time, f Filter, identities map[string]sessions.CodexIdentity, sets [3][]*rowChunk, key string) ([]Day, bool) {
 	all := heatDays{}

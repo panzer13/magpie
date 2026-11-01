@@ -5,12 +5,15 @@ import (
 	"cmp"
 	"encoding/json"
 	"errors"
+	"io"
 	"maps"
+	"math"
 	"net/http"
 	"os"
 	"reflect"
 	"runtime"
 	"runtime/debug"
+	"runtime/metrics"
 	"slices"
 	"strconv"
 	"strings"
@@ -22,6 +25,7 @@ import (
 	"github.com/yetone/magpie/internal/agent"
 	"github.com/yetone/magpie/internal/filememo"
 	"github.com/yetone/magpie/internal/proc"
+	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/sessions"
 	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/usage"
@@ -97,15 +101,38 @@ func sessionRoutes(mux *http.ServeMux, w Windows) {
 			n = sessions.All
 		}
 		agents := map[string]*agent.Agent{}
+		// what a row is named and drawn as, beside the list, for listTag
+		var drawn strings.Builder
 		for _, a := range agent.Clients() {
 			agents[a.ID] = a
+			drawn.WriteString(a.ID + "\x00" + a.SharedName() + "\x00" + a.Icon + "\x00")
 		}
 		out := sessionsJSON{Sessions: []sessionJSON{}, Terminal: runtime.GOOS == "darwin" && !isWeb(w),
 			Dirs: []string{}}
 		for _, d := range sessions.Dirs() {
 			out.Dirs = append(out.Dirs, tilde(d))
+			drawn.WriteString("\x01" + out.Dirs[len(out.Dirs)-1])
 		}
-		list := sessions.List(sessions.All)
+		// the page has this very answer when the listing, the usage log,
+		// the aliases and the agents are what they were when it was sent:
+		// told so without the rows being made, encoded and hashed again,
+		// ~60% of an unchanged poll's ~22 MB over ~17k real sessions
+		logV, logKnown := usage.LogVersion()
+		aliases := provider.UsageAliases()
+		now := listTag{log: logV, drawn: drawn.String(), aliases: aliases}
+		made := -1
+		listTags.Lock()
+		if t, ok := listTags.m[n]; ok && logKnown && t.same(now) && r.Header.Get("X-Magpie-Had") == t.tag {
+			made = t.made
+		}
+		listTags.Unlock()
+		list, made, same := sessions.ListUnless(sessions.All, made)
+		if same {
+			rw.Header().Set("X-Magpie-Tag", r.Header.Get("X-Magpie-Had"))
+			rw.Header().Set("X-Magpie-Same", "1")
+			rw.WriteHeader(http.StatusOK)
+			return
+		}
 		nativeKeys := make(map[string]bool, len(list))
 		for _, s := range list {
 			// its copies' and subagents' ids among them
@@ -119,45 +146,59 @@ func sessionRoutes(mux *http.ServeMux, w Windows) {
 		for _, g := range gateway {
 			ext = append(ext, gatewayListed(g, title))
 		}
-		list = sessions.MergeExternal(list, ext)
-		if len(list) > n {
-			list = list[:n]
-		}
-		var modelEffort map[string][]sessions.ModelEffort
-		for _, s := range list {
-			if s.Agent == "codex" {
-				modelEffort = usage.CodexModelEffort(usage.All)
-				break
+		// made to size: up to sessions.All rows, grown by append each poll
+		// was copied through every size on the way, ~140 MB of eight (#2278).
+		// The rows are made from the list and the gateway's sessions as
+		// they merge, not from a merged copy of the list.
+		out.Sessions = make([]sessionJSON, 0, min(n, len(list)+len(ext)))
+		codex := false
+		sessions.EachMerged(list, ext, func(s *sessions.Session) bool {
+			if len(out.Sessions) == n {
+				return false
 			}
-		}
-		for i := range list {
-			addCodexModelEffort(&list[i], modelEffort)
+			codex = codex || s.Agent == "codex"
+			out.Sessions = append(out.Sessions, sessionJSON{Session: *s})
+			return true
+		})
+		var modelEffort map[string][]sessions.ModelEffort
+		if codex {
+			modelEffort = usage.CodexModelEffort(usage.All)
 		}
 		since := time.Now()
-		for _, s := range list {
+		for i := range out.Sessions {
+			s := &out.Sessions[i].Session
+			addCodexModelEffort(s, modelEffort)
 			if !s.Start.IsZero() && s.Start.Before(since) {
 				since = s.Start
 			}
 		}
 		vias := usage.Vias(since.Add(-time.Minute))
-		// made to size: up to sessions.All rows, grown by append each poll
-		// was copied through every size on the way, ~140 MB of eight (#2278)
-		out.Sessions = make([]sessionJSON, 0, len(list))
-		for _, s := range list {
+		for i := range out.Sessions {
+			j := &out.Sessions[i]
+			s := j.Session
 			// drawn as the agent it ran in: Claude Desktop's Code tab's
 			// sessions are in Claude Code's folder (Session.App)
-			j := sessionJSON{Session: s, Name: s.Agent, Icon: "generic", Via: viaOf(vias, s)}
+			j.Name, j.Icon, j.Via = s.Agent, "generic", viaOf(vias, s)
 			if a := agents[cmp.Or(s.App, s.Agent)]; a != nil {
 				j.Name, j.Icon = a.SharedName(), a.Icon
 			}
 			j.Name = wslName(j.Name, s)
 			j.Path = tilde(j.Path)
-			out.Sessions = append(out.Sessions, j)
 		}
-		writeJSONRows(rw, r, "sessions", out.Sessions, struct {
+		listsRowed.Add(1)
+		tag := writeJSONRows(rw, r, "sessions", out.Sessions, struct {
 			Terminal bool     `json:"terminal"`
 			Dirs     []string `json:"dirs"`
 		}{out.Terminal, out.Dirs})
+		if tag != "" && logKnown {
+			now.made, now.tag = made, tag
+			listTags.Lock()
+			if listTags.m == nil || len(listTags.m) >= statsMemoMost {
+				listTags.m = map[int]listTag{}
+			}
+			listTags.m[n] = now
+			listTags.Unlock()
+		}
 	}))
 	// stats is every session's usage by day over the last ?days=N days
 	// (every day when 0 or none), cut by agent, folder and model for the
@@ -190,7 +231,7 @@ func sessionRoutes(mux *http.ServeMux, w Windows) {
 			rw.WriteHeader(http.StatusOK)
 			return
 		}
-		tag := writeSame(rw, r, func(b *bytes.Buffer) error { return statsAnswer(b, st, agents) })
+		tag := writeSame(rw, r, func(w io.Writer) error { return statsAnswer(w, st, agents) })
 		if tag != "" {
 			statsTags.Lock()
 			if statsTags.m == nil || len(statsTags.m) >= statsMemoMost {
@@ -365,7 +406,7 @@ func sessionRoutes(mux *http.ServeMux, w Windows) {
 			fail(rw, errors.New("no such session"))
 			return
 		}
-		if err := openTerminal(run, settings.Load().SessionTerminal); err != nil {
+		if err := openTerminal(run, s.Title, settings.Load().SessionTerminal); err != nil {
 			fail(rw, err)
 			return
 		}
@@ -384,17 +425,17 @@ func sessionRoutes(mux *http.ServeMux, w Windows) {
 			fail(rw, errors.New("opening Terminal is only for the Mac app"))
 			return
 		}
-		run := ""
+		run, name := "", ""
 		for _, a := range agent.Detected() {
 			if a.ID == in.Agent {
-				run = agentCommand(a)
+				run, name = agentCommand(a), a.Name
 			}
 		}
 		if run == "" {
 			fail(rw, errors.New("no command starts this agent"))
 			return
 		}
-		if err := agentTerminal(run, settings.Load().SessionTerminal); err != nil {
+		if err := agentTerminal(run, name, settings.Load().SessionTerminal); err != nil {
 			fail(rw, err)
 			return
 		}
@@ -429,7 +470,7 @@ func sessionRoutes(mux *http.ServeMux, w Windows) {
 			return
 		}
 		if in.Open {
-			if err := openTerminal(c.Command, settings.Load().SessionTerminal); err != nil {
+			if err := openTerminal(c.Command, s.Title, settings.Load().SessionTerminal); err != nil {
 				fail(rw, err)
 				return
 			}
@@ -537,6 +578,31 @@ type statsTag struct {
 	gen    uint64
 	agents map[string]string
 	tag    string
+}
+
+// listTags is, by ?limit, what the last list sent was made from and its
+// tag: an ask with that tag while all of it stands gets X-Magpie-Same
+// without the list being made. What a row shows beyond these (a Codex
+// thread's effort, a gateway session's title) is bounded by the listing,
+// made again at least once in sessions' listKeptFor.
+var listTags struct {
+	sync.Mutex
+	m map[int]listTag
+}
+
+// listsRowed counts the lists made into rows and sent, for tests.
+var listsRowed atomic.Int64
+
+type listTag struct {
+	made    int    // sessions.ListUnless's listing
+	log     uint64 // usage.LogVersion
+	drawn   string // the agents' names and icons, and the folders
+	aliases map[string]string
+	tag     string
+}
+
+func (t listTag) same(u listTag) bool {
+	return t.log == u.log && t.drawn == u.drawn && maps.Equal(t.aliases, u.aliases)
 }
 
 // sameStats is whether a and b would be sent the same: a read again
@@ -663,6 +729,7 @@ func warmSessions() {
 var warmOnce sync.Once
 
 func warmStart() {
+	steadyGCStart()
 	go func() {
 		// a fresh install reads no agent's sessions until asked; one
 		// that read them before keeps reading them (decided once)
@@ -761,8 +828,9 @@ func coldTurn(h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// underTightGC runs fn letting the heap grow by a tenth of what it holds
-// before a collection, not Go's default of all of it, and then puts back
+// underTightGC runs fn letting the heap grow by a tenth of what it holds,
+// or by tightGCRoom when that is more (tightPercent), before a
+// collection, not Go's default of all of it, and then puts back
 // what was set; a GOGC the user set lower, or off, is kept. The usage
 // page's read of the whole history holds every row of it at once (~270 MB
 // live for 390k calls), and a cold start that rests at ~200 MB peaked at
@@ -788,8 +856,10 @@ func underTightGC(fn func()) {
 // when the first to begin ended before the second.
 var tightGC struct {
 	sync.Mutex
-	n   int // reads under it
-	was int // GOGC before the first
+	n      int  // reads under it
+	was    int  // GOGC before the first
+	hooked bool // a retightenGC is waiting for the next collection
+	steady bool // steadyGCStart has run: retightenGC sets steadyPercent between reads
 }
 
 // tightenGC begins a read under a tight GC; undo ends it.
@@ -802,6 +872,10 @@ func tightenGC() (undo func()) {
 			debug.SetGCPercent(was)
 		}
 		tightGC.was = was
+		if tightGCRoom > 0 && !tightGC.hooked {
+			tightGC.hooked = true
+			afterNextGC(retightenGC)
+		}
 	}
 	tightGC.n++
 	return sync.OnceFunc(func() {
@@ -820,6 +894,104 @@ func tightenGC() (undo func()) {
 // MB and 271–275 MB, for ~20% more CPU in the first start's minute and
 // ~2 s a minute of polls asking ten answers every 5 s (#2278).
 const tightGCPercent = 10
+
+// tightGCRoom is the least a tight GC lets the heap grow by before a
+// collection. A tenth of a small heap is a few MB: a first start's reads
+// began on a ~50 MB heap and allocate ~400 MB a second, so it collected
+// ~28 times a second, 2,205 times in its first 78 s, and the collections
+// were 69–72 s of its ~4:10 of CPU (#2278). With this room a heap of
+// over 320 MB is held to a tenth still; one below grows by 32 MB. 0 in
+// tests, whose GOGC is read as tightGCPercent while a read is under it.
+var tightGCRoom = func() int64 {
+	if testing.Testing() {
+		return 0
+	}
+	return 32 << 20
+}()
+
+// tightPercent is the GOGC a tight GC sets on a live heap of live bytes:
+// tightGCPercent, or enough for tightGCRoom, never above was, what was
+// set before (off stays off).
+func tightPercent(live int64, was int) int {
+	p := tightGCPercent
+	if live > 0 && tightGCRoom > 0 {
+		p = max(p, int(min(tightGCRoom*100/live, math.MaxInt32)))
+	}
+	if was < p {
+		return was
+	}
+	return p
+}
+
+// retightenGC sets the GOGC for the heap the collection just left, while
+// a read is under a tight GC, and waits for the next one.
+func retightenGC() {
+	tightGC.Lock()
+	defer tightGC.Unlock()
+	if tightGC.n == 0 && !tightGC.steady {
+		tightGC.hooked = false
+		return
+	}
+	s := []metrics.Sample{{Name: "/gc/heap/live:bytes"}}
+	metrics.Read(s)
+	if s[0].Value.Kind() == metrics.KindUint64 {
+		live := int64(s[0].Value.Uint64())
+		if tightGC.n > 0 {
+			debug.SetGCPercent(tightPercent(live, tightGC.was))
+		} else {
+			debug.SetGCPercent(steadyPercent(live))
+		}
+	}
+	afterNextGC(retightenGC)
+}
+
+// steadyGCStart has the heap grow by half of what it holds before a
+// collection, or by steadyGCRoom when that is more, not Go's default of
+// all of it, for the life of the process; a GOGC the user set is kept.
+// A window resting on ~60 MB live polls /api/state, /api/drift and
+// /api/providers, ~10 MB thrown away a round, so at the default its
+// footprint peaked at 138 MB; under half, 107-108 MB, for ~9% more CPU in
+// the polls. Reads under a tight GC still set their tenth while they run.
+func steadyGCStart() {
+	if os.Getenv("GOGC") != "" {
+		return
+	}
+	tightGC.Lock()
+	defer tightGC.Unlock()
+	tightGC.steady = true
+	if tightGC.n == 0 {
+		debug.SetGCPercent(steadyPercent(0))
+	}
+	if !tightGC.hooked {
+		tightGC.hooked = true
+		afterNextGC(retightenGC)
+	}
+}
+
+// steadyGCPercent is the half steadyGCStart lets the heap grow by.
+const steadyGCPercent = 50
+
+// steadyGCRoom is the least it grows by: half of a small heap is a few
+// MB, and a heap under 64 MB grows by 32 MB, never by more than Go's
+// default.
+const steadyGCRoom = 32 << 20
+
+// steadyPercent is the GOGC steadyGCStart sets on a live heap of live
+// bytes (0 before the first collection: steadyGCPercent).
+func steadyPercent(live int64) int {
+	p := steadyGCPercent
+	if live > 0 {
+		p = max(p, int(min(steadyGCRoom*100/live, 100)))
+	}
+	return p
+}
+
+// afterNextGC runs fn on the finalizer goroutine once the next collection
+// has finished.
+func afterNextGC(fn func()) {
+	type tick struct{ _ *byte } // a pointer keeps it off the tiny allocator
+	runtime.SetFinalizer(&tick{}, func(*tick) { go fn() })
+}
 
 // agentCommand is the shell line that starts a: its Launch where it has
 // one (agy, Claude Science, Cursor Private Inference), else its own
@@ -846,15 +1018,23 @@ var agentTerminal = openTerminal
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
 // openTerminal runs a command in the chosen Mac terminal through a .command
-// file, as it would open from Finder: no Automation consent.
+// file, as it would open from Finder: no Automation consent; in Rex,
+// through its CLI, in a tab labelled label (terminal_rex.go).
 // The shell is left open when the agent quits.
-func openTerminal(command, choice string) error {
+func openTerminal(command, label, choice string) error {
 	var found terminalDiscovery
 	if choice != terminalBundleID {
 		var err error
 		// the system default falls back to Terminal when nothing is found
 		if found, err = discoverTerminals(); err != nil && choice != "" && choice != "system" {
 			return err
+		}
+	}
+	if choice == rexBundleID {
+		for _, app := range found.Apps {
+			if app.ID == rexBundleID {
+				return openInRex(app.Path, command, label)
+			}
 		}
 	}
 	args, err := terminalOpenArgs(choice, found)
@@ -898,52 +1078,75 @@ func viaOf(x usage.ViaIndex, s sessions.Session) []usage.Via {
 	return nil
 }
 
-// statsAnswer writes the stats answer into b as an Encoder of
-// struct{ sessions.Stats; Agents } does, its days one at a time: encoded
-// whole, the Encoder's own buffer grew to the ~6 MB answer from nothing
-// after each collection, ~200 MB of 90 s of polls while an agent worked
-// (#2278).
-func statsAnswer(b *bytes.Buffer, st sessions.Stats, agents map[string]string) error {
-	enc := json.NewEncoder(b)
+// statsAnswer writes the stats answer to w as an Encoder of
+// struct{ sessions.Stats; Agents } does, a part at a time: encoded whole,
+// the Encoder's own buffer grew to the ~6 MB answer from nothing after
+// each collection, ~200 MB of 90 s of polls while an agent worked, and a
+// buffer kept for the next held it between polls (#2278).
+func statsAnswer(w io.Writer, st sessions.Stats, agents map[string]string) error {
+	var part bytes.Buffer
+	enc := json.NewEncoder(&part)
 	// v as Marshal writes it: Encode ends it with a newline
 	put := func(v any) error {
+		part.Reset()
 		if err := enc.Encode(v); err != nil {
 			return err
 		}
-		b.Truncate(b.Len() - 1)
-		return nil
+		_, err := w.Write(part.Bytes()[:part.Len()-1])
+		return err
 	}
-	b.WriteString(`{"from":`)
+	text := func(s string) error {
+		_, err := io.WriteString(w, s)
+		return err
+	}
+	if err := text(`{"from":`); err != nil {
+		return err
+	}
 	if err := put(st.From); err != nil {
 		return err
 	}
-	b.WriteString(`,"to":`)
+	if err := text(`,"to":`); err != nil {
+		return err
+	}
 	if err := put(st.To); err != nil {
 		return err
 	}
-	b.WriteString(`,"days":`)
+	if err := text(`,"days":`); err != nil {
+		return err
+	}
 	if st.Days == nil {
-		b.WriteString("null")
+		if err := text("null"); err != nil {
+			return err
+		}
 	} else {
-		b.WriteByte('[')
+		if err := text("["); err != nil {
+			return err
+		}
 		for i := range st.Days {
 			if i > 0 {
-				b.WriteByte(',')
+				if err := text(","); err != nil {
+					return err
+				}
 			}
 			if err := put(&st.Days[i]); err != nil {
 				return err
 			}
 		}
-		b.WriteByte(']')
+		if err := text("]"); err != nil {
+			return err
+		}
 	}
-	b.WriteString(`,"keys":`)
+	if err := text(`,"keys":`); err != nil {
+		return err
+	}
 	if err := put(st.Keys); err != nil {
 		return err
 	}
-	b.WriteString(`,"agents":`)
+	if err := text(`,"agents":`); err != nil {
+		return err
+	}
 	if err := put(agents); err != nil {
 		return err
 	}
-	b.WriteString("}\n")
-	return nil
+	return text("}\n")
 }

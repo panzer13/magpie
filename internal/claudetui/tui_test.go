@@ -98,6 +98,13 @@ func fakeClaude(args []string) {
 		time.Sleep(time.Minute)
 		os.Exit(0)
 	}
+	if os.Getenv("FAKE_NOTES") == "1" {
+		// onboarding not done: the first-run notes, as 2.1.316 draws them,
+		// a space a move of the cursor or a no-break space
+		fmt.Print("\r\n Security\x1b[1Cnotes:\r\n\r\n 1. Claude can make mistakes\r\n    You should always review Claude's responses\r\n\r\n 2. Due to prompt injection risks, only use it with code you trust\r\n\r\n Press\u00a0Enter\x1b[1Cto\x1b[1Ccontinue…\r\n")
+		time.Sleep(time.Minute)
+		os.Exit(0)
+	}
 	sid := ""
 	if i := slices.Index(args, "--session-id"); i >= 0 {
 		sid = args[i+1]
@@ -113,6 +120,19 @@ func fakeClaude(args []string) {
 	}
 	// what it was started with, for the test to read
 	_ = os.WriteFile(filepath.Join(os.Getenv("CLAUDE_CONFIG_DIR"), "args"), []byte(strings.Join(args, "\n")), 0o600)
+	// FAKE_TAP: Bun loads the tap BUN_OPTIONS names, which says so, and
+	// each reply is streamed to it before its message is written
+	var tapped *os.File
+	if os.Getenv("FAKE_TAP") == "1" {
+		_, js, _ := strings.Cut(os.Getenv("BUN_OPTIONS"), "--preload ")
+		if b, err := os.ReadFile(js); err == nil && string(b) == string(tapJS) {
+			tapped, _ = os.OpenFile(os.Getenv(tapEnv), os.O_APPEND|os.O_WRONLY, 0)
+		}
+		if tapped != nil {
+			_, _ = tapped.WriteString(`{"tap":"on"}` + "\n")
+		}
+	}
+	streams := 0
 	fmt.Print("\r\n❯ ")
 	// the prompt's words; an image file's path pasted alone is read a
 	// moment later and becomes "[Image #<n>:<its bytes>]" where the
@@ -168,6 +188,20 @@ func fakeClaude(args []string) {
 		line := typed.String()
 		typed.Reset()
 		mu.Unlock()
+		if tapped != nil {
+			streams++
+			n := streams
+			for _, e := range []string{`{"type":"message_start","message":{"id":"msg_1","model":"claude-haiku","usage":{"input_tokens":3}}}`,
+				`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+				`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"echo: "}}`,
+				`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":` + strconvQuote(line) + `}}`,
+				`{"type":"content_block_stop","index":0}`,
+				`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}`,
+				`{"type":"message_stop"}`} {
+				_, _ = fmt.Fprintf(tapped, `{"s":%d,"e":%s}`+"\n", n, e)
+			}
+			_, _ = fmt.Fprintf(tapped, `{"s":%d,"end":"done"}`+"\n", n)
+		}
 		f, _ := os.OpenFile(filepath.Join(dir, sid+".jsonl"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 		rows := []any{
 			map[string]any{"type": "user", "message": map[string]any{"role": "user", "content": line}},
@@ -240,6 +274,11 @@ func runShim(t *testing.T, env []string, pargs []string, lines []string, want in
 		}
 	}
 	return out
+}
+
+func strconvQuote(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
 }
 
 func fakePath(t *testing.T) string {
@@ -330,117 +369,113 @@ func TestShimPastesImages(t *testing.T) {
 	}
 }
 
-// A folder of images a killed helper left is removed by a later one after
-// imagesLeft, and one in use isn't.
-func TestDropLeftImages(t *testing.T) {
+// A folder of images or a tap's a killed helper left is removed by a
+// later one after imagesLeft, and one in use isn't.
+func TestDropLeft(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("TMPDIR", tmp)
 	t.Setenv("TMP", tmp)
 	t.Setenv("TEMP", tmp)
-	old, now := filepath.Join(tmp, imagesPrefix+"1-a"), filepath.Join(tmp, imagesPrefix+"2-b")
-	for _, d := range []string{old, now} {
-		if err := os.MkdirAll(d, 0o700); err != nil {
+	for _, prefix := range []string{imagesPrefix, tapPrefix} {
+		old, now := filepath.Join(tmp, prefix+"1-a"), filepath.Join(tmp, prefix+"2-b")
+		for _, d := range []string{old, now} {
+			if err := os.MkdirAll(d, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			_ = os.WriteFile(filepath.Join(d, "image-1.png"), []byte("x"), 0o600)
+		}
+		then := time.Now().Add(-imagesLeft - time.Minute)
+		if err := os.Chtimes(old, then, then); err != nil {
 			t.Fatal(err)
 		}
-		_ = os.WriteFile(filepath.Join(d, "image-1.png"), []byte("x"), 0o600)
-	}
-	then := time.Now().Add(-imagesLeft - time.Minute)
-	if err := os.Chtimes(old, then, then); err != nil {
-		t.Fatal(err)
-	}
-	dropLeftImages()
-	if _, err := os.Stat(old); !os.IsNotExist(err) {
-		t.Errorf("the folder left %s ago is still there (%v)", imagesLeft, err)
-	}
-	if _, err := os.Stat(now); err != nil {
-		t.Errorf("the folder in use was removed: %v", err)
-	}
-}
-
-func TestShimFallsBackToPrint(t *testing.T) {
-	for _, c := range []struct {
-		name   string
-		env    []string
-		broken bool
-	}{
-		{"failed start", []string{"FAKE_FAIL=1"}, true},
-		{"untrusted folder", []string{"FAKE_TRUST=1"}, false},
-		// at once, not after readyWait: runShim waits 30s (#4504)
-		{"asks to sign in", []string{"FAKE_LOGIN=1"}, true},
-	} {
-		t.Run(c.name, func(t *testing.T) {
-			out := runShim(t, c.env, append([]string{fakePath(t)}, pArgs...), []string{"hello"}, 1)
-			if out[0]["result"] != "print mode" {
-				t.Fatalf("got %v, want the -p run's answer", out)
-			}
-			home := filepath.Dir(os.Getenv("MAGPIE_TUI_TEST_CFG"))
-			m, _ := filepath.Glob(filepath.Join(home, "*", "*", "magpie", "claude-tui-broken"))
-			m2, _ := filepath.Glob(filepath.Join(home, "*", "magpie", "claude-tui-broken"))
-			if got := len(m)+len(m2) > 0; got != c.broken {
-				t.Fatalf("marked broken: %v, want %v", got, c.broken)
-			}
-		})
-	}
-}
-
-// Each failed start in a row keeps runs on -p longer, to a day; one that
-// shows its prompt forgets them.
-func TestBrokenGrows(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, "cache"))
-	t.Setenv("LOCALAPPDATA", filepath.Join(home, "cache"))
-	for n, want := range map[int]time.Duration{1: 30 * time.Minute, 2: time.Hour, 3: 2 * time.Hour, 6: 16 * time.Hour, 7: 24 * time.Hour, 40: 24 * time.Hour} {
-		if got := brokenFor(n); got != want {
-			t.Errorf("brokenFor(%d) = %s, want %s", n, got, want)
+		dropLeft()
+		if _, err := os.Stat(old); !os.IsNotExist(err) {
+			t.Errorf("the %s folder left %s ago is still there (%v)", prefix, imagesLeft, err)
+		}
+		if _, err := os.Stat(now); err != nil {
+			t.Errorf("the %s folder in use was removed: %v", prefix, err)
 		}
 	}
-	if _, ok := BrokenSince(); ok {
-		t.Fatal("broken with no mark")
-	}
-	MarkBroken()
-	MarkBroken()
-	if _, n, _ := brokenRead(); n != 2 {
-		t.Fatalf("count %d, want 2", n)
-	}
-	// 45 minutes ago: past one failure's 30 minutes, within two's hour
-	old := time.Now().Add(-45 * time.Minute)
-	_ = os.Chtimes(broken(), old, old)
-	if _, ok := BrokenSince(); !ok {
-		t.Fatal("two failures 45 minutes ago went back to the interactive mode")
-	}
-	_ = os.WriteFile(broken(), nil, 0o600) // a mark from before the count
-	_ = os.Chtimes(broken(), old, old)
-	if _, ok := BrokenSince(); ok {
-		t.Fatal("an old mark 45 minutes ago still holds")
-	}
-	clearBroken()
-	if _, _, ok := brokenRead(); ok {
-		t.Fatal("cleared, the mark stayed")
-	}
 }
 
-// A start that shows its prompt removes the mark of earlier failures, so
-// the next failure counts from one.
-func TestShimStartClearsBroken(t *testing.T) {
-	home := t.TempDir()
-	env := []string{"HOME=" + home, "XDG_CACHE_HOME=" + filepath.Join(home, "cache"), "LOCALAPPDATA=" + filepath.Join(home, "cache")}
-	for _, e := range env {
-		k, v, _ := strings.Cut(e, "=")
-		t.Setenv(k, v)
+// runEnds runs the shim in home, told "hello", until it
+// exits or answers: what it wrote, its stderr, and how it ended.
+func runEnds(t *testing.T, home string, env []string) (out, stderr string, err error) {
+	t.Helper()
+	exe, _ := os.Executable()
+	cfg := filepath.Join(home, "claude")
+	tmp := filepath.Join(home, "tmp")
+	_ = os.Mkdir(tmp, 0o700)
+	cmd := exec.Command(exe, append([]string{fakePath(t)}, pArgs...)...)
+	cmd.Env = append(os.Environ(), "MAGPIE_TUI_TEST=shim", "HOME="+home, "XDG_CACHE_HOME="+filepath.Join(home, "cache"), "LOCALAPPDATA="+filepath.Join(home, "cache"),
+		"TMPDIR="+tmp, "TMP="+tmp, "TEMP="+tmp, "CLAUDE_CONFIG_DIR="+cfg)
+	cmd.Env = append(cmd.Env, env...)
+	stdin, _ := cmd.StdinPipe()
+	stdout, _ := cmd.StdoutPipe()
+	var errb strings.Builder
+	cmd.Stderr = &errb
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
 	}
-	// three failures, the last a day and a half ago: past its 2 hours
-	MarkBroken()
-	MarkBroken()
-	MarkBroken()
-	old := time.Now().Add(-36 * time.Hour)
-	_ = os.Chtimes(broken(), old, old)
-	out := runShim(t, env, append([]string{fakePath(t)}, pArgs...), []string{"hello"}, 3)
-	if out[0]["subtype"] != "init" {
-		t.Fatalf("got %v, want an interactive turn", out)
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+	b, _ := json.Marshal(map[string]any{"type": "user", "message": map[string]any{"role": "user", "content": "hello"}})
+	_, _ = stdin.Write(append(b, '\n'))
+	done := make(chan string, 1)
+	go func() {
+		var all strings.Builder
+		sc := bufio.NewScanner(stdout)
+		for sc.Scan() {
+			all.WriteString(sc.Text() + "\n")
+			if strings.Contains(sc.Text(), `"type":"result"`) {
+				break
+			}
+		}
+		done <- all.String()
+	}()
+	select {
+	case out = <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the shim neither answered nor ended in 30s")
 	}
-	if _, _, ok := brokenRead(); ok {
-		t.Fatal("a start that showed its prompt left the mark")
+	if !strings.Contains(out, `"type":"result"`) {
+		err = cmd.Wait()
+	}
+	return out, errb.String(), err
+}
+
+// An interactive mode that doesn't come up ends the run, saying why, and
+// never becomes -p: a -p request counts against the plan as another
+// client's would, and starts without the interactive mode's cache. Nothing
+// is kept for the next run, which tries the interactive mode again.
+func TestShimNeverPrints(t *testing.T) {
+	for _, c := range []struct {
+		name, why string
+		env       []string
+	}{
+		{"failed start", "something went wrong", []string{"FAKE_FAIL=1"}},
+		{"untrusted folder", "trust the folder", []string{"FAKE_TRUST=1"}},
+		// at once, not after readyWait: runEnds waits 30s (#4504)
+		{"asks to sign in", "sign", []string{"FAKE_LOGIN=1"}},
+		{"first-run notes", "notes", []string{"FAKE_NOTES=1"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			home := t.TempDir()
+			out, stderr, err := runEnds(t, home, c.env)
+			if err == nil || strings.Contains(out, "print mode") {
+				t.Fatalf("ended %v, wrote %q", err, out)
+			}
+			if !strings.Contains(stderr, "claude-tui: ") || !strings.Contains(strings.ToLower(stderr), c.why) || strings.Contains(stderr, "-p") {
+				t.Fatalf("stderr %q", stderr)
+			}
+			// the next run, Claude Code fixed, is the interactive mode
+			out, stderr, err = runEnds(t, home, nil)
+			if err != nil || strings.Contains(out, "print mode") || !strings.Contains(out, "echo: hello") {
+				t.Fatalf("the next run ended %v, wrote %q, stderr %q", err, out, stderr)
+			}
+		})
 	}
 }
 
@@ -504,5 +539,57 @@ func TestTranslatorAPIError(t *testing.T) {
 	}
 	if r := l.out[2]; r["is_error"] != true || r["result"] != "You've hit your limit" || r["api_error_status"] != float64(429) {
 		t.Fatalf("result %v", r)
+	}
+}
+
+// An assistant row is told with its uuid, its place in the session, as
+// -p tells it: the bridge cuts a branch of the session there (bbfatx on
+// X). Told without it, no branch could be made of an interactive run's
+// session.
+func TestTranslatorTellsTheRowsUUID(t *testing.T) {
+	l := &lines{}
+	tr := newTranslator(l)
+	tr.row([]byte(`{"type":"assistant","uuid":"row-1","message":{"id":"m","model":"claude-opus-5-5","content":[{"type":"tool_use","id":"toolu_1","name":"mcp__magpie__Read","input":{}}]}}`))
+	if len(l.out) != 1 || l.out[0]["uuid"] != "row-1" {
+		t.Fatalf("got %v", l.out)
+	}
+}
+
+// A Claude Code in WSL is pasted an image's path as the distro reads it,
+// and is handed TERM through WSLENV, the gateway's own names kept.
+func TestShimInWSL(t *testing.T) {
+	s := &shim{wsl: &WSL{Args: []string{"-d", "Ubuntu"}, Mount: "/mnt/", Projects: `\\wsl$\Ubuntu\home\me\.claude\projects`}}
+	if got := s.path(`C:\Users\me\AppData\Local\Temp\magpie-images-1\1.png`); got != "/mnt/c/Users/me/AppData/Local/Temp/magpie-images-1/1.png" {
+		t.Fatalf("path %q", got)
+	}
+	if got := (&shim{}).path("/tmp/a.png"); got != "/tmp/a.png" {
+		t.Fatalf("this machine's path %q", got)
+	}
+	t.Setenv(WSLEnv, `{"args":["-d","Ubuntu"],"projects":"x"}`)
+	t.Setenv("WSLENV", "CLAUDE_CONFIG_DIR/p")
+	env := childEnv()
+	var wslenv []string
+	for _, e := range env {
+		if strings.HasPrefix(e, WSLEnv+"=") {
+			t.Fatalf("the child was handed %s", e)
+		}
+		if strings.HasPrefix(strings.ToUpper(e), "WSLENV=") {
+			wslenv = append(wslenv, e)
+		}
+	}
+	if len(wslenv) != 1 || wslenv[0] != "WSLENV=CLAUDE_CONFIG_DIR/p:TERM" {
+		t.Fatalf("WSLENV %q", wslenv)
+	}
+	// the tap's go through WSLENV too, in place of the shim's own
+	t.Setenv("BUN_OPTIONS", "--smol")
+	env = childEnv("BUN_OPTIONS=--preload /mnt/c/t/tap.js", tapEnv+"=/mnt/c/t/tap.jsonl")
+	var bun []string
+	for _, e := range env {
+		if strings.HasPrefix(e, "BUN_OPTIONS=") || strings.HasPrefix(e, tapEnv+"=") || strings.HasPrefix(e, "WSLENV=") {
+			bun = append(bun, e)
+		}
+	}
+	if want := []string{"WSLENV=CLAUDE_CONFIG_DIR/p:TERM:BUN_OPTIONS:" + tapEnv, "BUN_OPTIONS=--preload /mnt/c/t/tap.js", tapEnv + "=/mnt/c/t/tap.jsonl"}; !slices.Equal(bun, want) {
+		t.Fatalf("env %q, want %q", bun, want)
 	}
 }

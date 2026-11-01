@@ -171,7 +171,9 @@ type Tool struct {
 
 // Request is a call to a model, whichever API it arrived in.
 type Request struct {
-	// clientCache is non-nil only for the Claude bridge's explicit opt-in.
+	// clientCache is non-nil only for a request read with its client's
+	// marks: the Claude bridge's explicit opt-in, and a Messages ask
+	// translated to an Anthropic upstream (parseTranslated, #4571).
 	clientCache *clientCache
 	// leanPrompt has the Claude bridge give the caller's instructions as
 	// the run's system prompt, in place of Claude Code's (ClaudeLeanPrompt).
@@ -185,6 +187,8 @@ type Request struct {
 	// Code's environment as a {role: "system"} message), not in the
 	// caller's instructions (envTurnsNote).
 	envInTurns bool
+	// envDir: that working directory, as the caller names it.
+	envDir string
 	// envUnknown: the caller is on another computer (remoteCaller) and its
 	// instructions name no working directory, so the run's own prompt
 	// describes a machine no tool runs on, and nothing says which does
@@ -192,6 +196,10 @@ type Request struct {
 	envUnknown bool
 	// remoteCaller: the request came from another computer (not local).
 	remoteCaller bool
+	// branch, for the Claude bridge, is the session of the run whose
+	// reply made the calls this request answers after another request
+	// did: its run branches off it there (subscriptionBridge.branch).
+	branch *savedSession
 	// hourMarks has the cache marks magpie adds on Anthropic's Messages
 	// (anthropicBody) last an hour: a Responses client's (Codex's), whose
 	// turns are often more than five minutes apart and whose own vendor
@@ -202,6 +210,11 @@ type Request struct {
 	// draws asks the model for images beside text: a drawing asked on
 	// Gemini's API of a model not named for images (drawCodeAssist).
 	draws bool
+
+	// strictSaid has a Chat request's tools say strict as each is set,
+	// false included, as OpenCode's own do: Zen's free tier
+	// (zenFreeTools).
+	strictSaid bool
 
 	Model      string
 	System     string
@@ -419,6 +432,10 @@ type Usage struct {
 	// cacheUnknown: the reply said its vendor counts no cache tokens
 	// (a plugin's magpie_cache_unknown), so a CacheRead of 0 is not a miss
 	cacheUnknown bool
+	// searches: the web searches the reply says its model ran with its
+	// provider's own tool (searchTally), for the request log's Web search
+	// rows; told nowhere else
+	searches int
 
 	Reasoning int `json:"reasoning"`
 	// Served: the model the vendor's reply says answered, when it named
@@ -498,6 +515,7 @@ func (u *Usage) add(v Usage) {
 	}
 	u.cacheCreationReported = u.cacheCreationReported || v.cacheCreationReported
 	u.cacheUnknown = u.cacheUnknown || v.cacheUnknown
+	u.searches = max(u.searches, v.searches)
 	if v.Reasoning > 0 {
 		u.Reasoning = v.Reasoning
 	}
@@ -676,6 +694,9 @@ func (c *collector) add(ev Event) {
 	case KUsage:
 		c.res.Usage.add(ev.Usage)
 		c.res.Usage.add(Usage{RequestID: ev.RequestID})
+		if ev.Model != "" {
+			c.res.Model = ev.Model // another model went on with the reply
+		}
 	case KError:
 		c.err, c.errStatus, c.errCode, c.errSaid = ev.Text, ev.Status, ev.Code, ev.Said
 	case KSearch:
@@ -911,6 +932,10 @@ func budgetOf(effort string) int {
 	}
 	return 10000
 }
+
+// ThinkingBudget is the Anthropic thinking budget the gateway reads an
+// effort level as, for an agent's config that has to name one (ZCode's).
+func ThinkingBudget(effort string) int { return budgetOf(effortOf(effort)) }
 
 // effortOfBudget goes the other way, for Anthropic clients asking others.
 func effortOfBudget(n int) string {

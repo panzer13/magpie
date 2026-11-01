@@ -144,10 +144,11 @@ node --test --test-concurrency=1 internal/gui/tests/gateway-caller-keys.test.cjs
 
 ## Other Browser Regressions
 
-`mask-alert.test.cjs` checks Settings › Usage's Masking alert (Must2333 on
-X): after the task done alert, Off to begin with; On saves `maskAlert`,
-another setting saved later keeps it, Off saves false, no click moves the
-page, and the row goes while masking is switched off. Every language at 900
+`mask-alert.test.cjs` checks Insights › Masking's Masking alert (Must2333 on
+X): after the page's list and not in Settings › Usage (nb5p on Discord), Off
+to begin with; On saves `maskAlert`, another setting saved later keeps it,
+Off saves false, no click moves the page, and the row goes while masking is
+switched off. Every language at 900
 and 380 wide, in Chromium and WebKit, with the API faked.
 
 `local-address.test.cjs` checks the Address of a local server's provider
@@ -263,6 +264,14 @@ asked for and names the pill, with the bar held where it was; three days need
 no such pill; a window narrowed then widened fits again. Chromium and WebKit,
 in English, Chinese, Japanese and German.
 
+`routing-day-tallies.test.cjs` checks #3351: live, an account's row under
+Accounts and keys counts its day from the tallies the history read brings
+(the Usage page's own files), not the kept requests — an account in no
+request the gateway keeps still shows its day and its failures, the
+kept account says its day's twelve over the kept ten, and the note says
+the counts are today's. Chromium and WebKit, in English, Chinese,
+Traditional Chinese, Japanese and German.
+
 `dates-gui-lang.test.cjs` checks that dates and times read in the GUI's
 language, not the system's (#1843): English on a zh-CN browser, English on
 en-GB (the system's own English kept), and Chinese, Traditional Chinese,
@@ -328,6 +337,14 @@ leaving it off; Save posting each changed one by the plugin's provider id
 before the provider, and none switched back. Chromium and WebKit, 1100 and
 420 wide, every language.
 
+`plugin-option-words.test.cjs` checks a plugin option in the reader's
+language (plugins#590): its `labels`, `descriptions` and `confirms` by the
+window's language, zh-TW falling back to zh and the rest to the plain
+words; and, while a `filtersModels` switch is on as saved, the note under
+the Models field's chips that the list is filtered, inside the editor; off,
+none. A WorkBuddy moved onto its plugin, Chromium and WebKit, 1100 and 420
+wide, every language.
+
 `plugin-move-overflow.test.cjs` checks a Plugins card that offers a
 built-in's accounts: the button is one word beside the name, as Install is
 ("Move", its title saying whose accounts and how many), on one line, and it
@@ -362,6 +379,12 @@ why one didn't load, updates one and removes one. The add sheet's
 "More in Plugins" row (the providers list has no button of its own) and
 "look for a plugin" link lead there. English and Chinese, Chromium and WebKit,
 with the API faked.
+
+`plugin-npm-unknown.test.cjs` checks that a suggested plugin npm said
+nothing of (npm or the dist branch not read in time) offers Install, not
+Coming soon, and that the page asks again and then shows its version,
+while one npm said it doesn't have still reads Coming soon. Every
+language, Chromium and WebKit, wide and narrow, with the API faked.
 
 `plugins-more-discover.test.cjs` checks that the add sheet's "More in
 Plugins" row and its "look for a plugin" link open Plugins on Discover,
@@ -1012,8 +1035,12 @@ asked in the app's own dialog; Cancel and Escape post nothing and go back to
 the editor, Sign out posts login/forget and says so. With another account
 saved the one in use has no Sign out but Remove, which posts login/forget
 (vincentzhang1_55530 on Discord: magpie signs Codex in to another account
-first), and a signed_in refusal is said in the reader's language. No select, no left border, the page doesn't move; in
-English and Chinese.
+first), and a signed_in refusal is said in the reader's language. Claude Code
+signed in to one of two accounts has Remove too (StringKe, #4532); signed in to
+its only account it can be signed in to (the other a setup token) it has neither
+Remove nor Sign out and says why in zh, zh-TW, ja and de, and a signed_in_only
+refusal is said in the reader's language. No select, no left border, the page
+doesn't move; in English and Chinese.
 
 `nokey-editor.test.cjs` opens two local Ollama providers saved with no key,
 one from the preset and one custom, as /api/providers gives them: a click
@@ -1030,6 +1057,15 @@ window with its head and Save in sight and uncovered, and the wheel held
 over the model chips runs them to the last one and then takes the editor's
 body on to its end, where the chips' held ends stopped it; the page never
 moves. In Chromium and WebKit, English and Chinese.
+
+`editor-quota-quiet.test.cjs` holds a subscription's allowance read
+(/api/login/usage) while its editor opens, then lets it answer, empty and
+with meters, in congee949's fixture (#3492: five accounts, 16 models,
+1960x1015): the editor drawn again for it keeps the dialog at opacity 1
+and its top in every frame, its body's scroll and the focus, where the
+whole dialog played its swap from opacity .5 and 2px down. Codex's only
+account's Sign out, and Cancel back to the editor, still play the swap.
+In Chromium and WebKit, English and Chinese.
 
 `group-from-model-add.test.cjs` opens the Routing page on a new group made
 from a model (?newgroup=, as "Make a routing group of it" does; 悠悠哥 on
