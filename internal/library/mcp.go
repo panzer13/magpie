@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"maps"
 	"math"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"sort"
@@ -21,6 +22,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/yetone/magpie/internal/agent"
+	"github.com/yetone/magpie/internal/claudelock"
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/filememo"
 	"github.com/yetone/magpie/internal/imagemcp"
@@ -223,6 +225,10 @@ const (
 	// fmtZed is Zed's settings.json context_servers: command/args/env, or
 	// url/headers, which Zed speaks streamable HTTP to
 	fmtZed
+	// fmtKiro is Kiro CLI's ~/.kiro/settings/mcp.json: mcpServers of
+	// command/args/env or url/headers — no type on an entry, its shape
+	// saying which, and no way to name SSE (kiro.dev/docs/mcp/configuration)
+	fmtKiro
 )
 
 // mcpFile is the file an agent keeps its user-wide MCP servers in.
@@ -273,7 +279,7 @@ func (f *mcpFile) supports(s *Server) error {
 	if f.Format == fmtDesktop && s.Remote() {
 		return errNoRemote
 	}
-	if s.Transport == "sse" && (f.Format == fmtCodex || f.Format == fmtGoose || f.Format == fmtDsh || f.Format == fmtPiNative || f.Format == fmtGrok || f.Format == fmtCommandCode || f.Format == fmtZed) {
+	if s.Transport == "sse" && (f.Format == fmtCodex || f.Format == fmtGoose || f.Format == fmtDsh || f.Format == fmtPiNative || f.Format == fmtGrok || f.Format == fmtCommandCode || f.Format == fmtZed || f.Format == fmtKiro) {
 		return errNoSSE
 	}
 	if f.Format == fmtDsh && s.Name != "" && !dshServerName.MatchString(s.Name) {
@@ -315,7 +321,8 @@ var errNoRemote = errors.New("no-remote")
 // over SSE (Codex, Goose, DeepSeek Harness, Pi's own MCP, Grok Build — its
 // type = "sse" is taken, but it speaks streamable HTTP to it all the same,
 // Command Code, whose own add refuses sse, Zed, whose only remote transport
-// POSTs to the url: crates/context_server/src/transport/http.rs).
+// POSTs to the url: crates/context_server/src/transport/http.rs, Kiro CLI,
+// whose docs name no SSE at all).
 var errNoSSE = errors.New("no-sse")
 
 // ordered is a JSON object that keeps its keys in the order given, so an
@@ -658,6 +665,18 @@ func (f *mcpFile) encode(s *Server) ordered {
 				add("transport", "stdio")
 			}
 		}
+	case fmtKiro:
+		// as the docs show them: command/args/env, or url/headers — no
+		// type, the entry's shape saying which (kiro.dev/docs/mcp/
+		// configuration); an SSE server never comes this far
+		if s.Remote() {
+			add("url", s.URL)
+			optional("headers", s.Headers)
+		} else {
+			add("command", s.Command)
+			add("args", list(s.Args))
+			optional("env", s.Env)
+		}
 	case fmtCline:
 		// as `cline mcp add` writes it; a url with no type would be SSE
 		if s.Remote() {
@@ -944,6 +963,15 @@ func (f *mcpFile) decode(name string, m map[string]any) (*Server, bool) {
 		if f.Format == fmtPiNative && name == HubEntry {
 			s.about = str(m, "description")
 		}
+	case fmtKiro:
+		// a url is streamable HTTP: the docs give no way to name SSE
+		// (kiro.dev/docs/mcp/configuration), so no transport in the entry
+		// is read as one
+		if u := str(m, "url"); u != "" {
+			remote("http", u, m["headers"])
+		} else {
+			local(str(m, "command"), m["args"], m["env"])
+		}
 	default: // Claude Code, Cursor, Copilot, Crush, ZCode, omp, Grok, Zed
 		t := str(m, "type")
 		if u := str(m, "url"); u != "" {
@@ -1228,6 +1256,9 @@ var owned = map[mcpFormat][]string{
 	fmtCommandCode: {"transport", "type", "url", "headers", "command", "args", "env"},
 	// enabled, remote, timeout and oauth are the user's
 	fmtZed: {"url", "headers", "command", "args", "env"},
+	// disabled, autoApprove, disabledTools and oauth are the user's; a
+	// transport names nothing Kiro reads
+	fmtKiro: {"transport", "url", "headers", "command", "args", "env"},
 
 	// a url agy read in place of serverUrl goes when magpie writes one
 	fmtAntigravity: {"type", "serverUrl", "url", "headers", "command", "args", "env"},
@@ -1350,6 +1381,13 @@ func (f *mcpFile) putEntry(s *Server, o ordered) error {
 		}
 		return nil
 	}
+	// Claude Code saves the file under its own lock: read and written
+	// back under it, or a save of its own between the two is lost (#4747)
+	release, err := f.claudeLock()
+	if err != nil {
+		return err
+	}
+	defer release()
 	// Pi's files, or Desktop's, all of them or none
 	return edit.Atomically(func() error {
 		for _, a := range f.also() {
@@ -1394,6 +1432,13 @@ func (f *mcpFile) del(name string) error {
 	case fmtHermes:
 		return edit.DelYAML(f.Path, f.key()+"."+name)
 	}
+	// Claude Code saves the file under its own lock: read and written
+	// back under it, or a save of its own between the two is lost (#4747)
+	release, err := f.claudeLock()
+	if err != nil {
+		return err
+	}
+	defer release()
 	return edit.Atomically(func() error {
 		for _, a := range f.also() {
 			if err := a.del(name); err != nil {
@@ -1418,6 +1463,19 @@ func (f *mcpFile) del(name string) error {
 		}
 		return edit.DelJSON(f.Path, f.key()+"."+name)
 	}, f.files()...)
+}
+
+// claudeLock takes the lock Claude Code saves its .claude.json under,
+// when the file f writes is that one (claudeJSON): held while it is read
+// and written back, or a save of its own between the two is lost
+// (#4747). No other file of the library's has a lock of Claude Code's to
+// take, and a distro's copy isn't this machine's file: the Claude Code
+// there saves under a lock in the distro's own files.
+func (f *mcpFile) claudeLock() (func(), error) {
+	if f.Format != fmtClaude || filepath.Clean(f.Path) != filepath.Clean(claudeJSON()) {
+		return func() {}, nil
+	}
+	return claudelock.Config(f.Path)
 }
 
 // ---- Codex's TOML ---------------------------------------------------------

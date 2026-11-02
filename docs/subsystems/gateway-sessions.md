@@ -106,7 +106,15 @@ is some. The overview's top summaries (`MergeExternalStats`) carry
 where a folder would be, with "(prompt not recorded)" when no text was kept,
 so it doesn't read as a native session with an empty prompt (#2285: a Pi
 subagent whose session file is in a temp folder). Verification:
-`TestTopSessionsMarkWhatOnlyTheGatewaySaw`, `sessions-overview.test.cjs`. Their
+`TestTopSessionsMarkWhatOnlyTheGatewaySaw`, `sessions-overview.test.cjs`.
+`/api/sessions` makes a row only of the gateway sessions its limit can
+show: `usage.EachGatewaySession` walks the projection newest first without
+a copy, `listedExternal` stops at the limit, and `sessions.EachMerged`
+makes each row when the merge reaches it. Every one of ~10k gateway
+sessions past the natives' cap was copied three times and made a row on
+each poll while a session grew. Verification:
+`TestSessionsListMakesOnlyTheGatewayRowsItShows`,
+`TestEachMergedMakesOnlyTheRowsItReaches`. Their
 models, token totals, start/last timestamps and effective prices come from the
 same usage records used by Usage and stats endpoints.
 
@@ -716,6 +724,15 @@ arguments are never kept, not even masked.
 `TestMCPCalledFromStdioIsARow` and the others in `mcp_calls_test.go`,
 `TestToolCallsAreReported` (imagemcp), `TestMCPCallRowsListedNotCounted`
 (usage) and `usage-ledger-mcp.test.cjs` cover it.
+
+A request a provider plugin sends its vendor by itself (Devin's cache
+keep-alive ping, plugins#592) never passes the gateway. The plugin
+reports it through `input.magpie.usage` and `usage.pluginCall` writes it
+as a row of agent `magpie` with the plugin's kind (`cache_keepalive`,
+"Cache keep-alive" in `purposeKinds`). Unlike a probe it is counted:
+priced and in every total (see
+[provider-plugins.md](provider-plugins.md#a-request-a-plugin-sends-by-itself)).
+`TestPluginKeepaliveIsCounted`.
 
 ### Requests magpie sends on its own
 
