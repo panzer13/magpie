@@ -13,12 +13,14 @@ package gateway
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
 	"math"
 	"net/http"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -378,8 +380,8 @@ const (
 	failAuth   = "auth"
 	// failCanceled: the agent went away before the answer came
 	failCanceled = "canceled"
-	// failForeign: the conversation's reasoning was sealed by another
-	// account, and is sent again without it
+	// failForeign: the conversation's reasoning, or another item's sealed
+	// copy, was sealed by another account, and is sent again without it
 	failForeign = "foreign"
 	// failFloor: the request asked for a shorter reply than the provider
 	// gives, and is sent again asking for the least it takes
@@ -832,6 +834,32 @@ var (
 // RestOf is why what rests by key — a provider's id, or its id#key — is
 // passed over now, while it is.
 func RestOf(key string) (Rest, bool) { return restOf(key) }
+
+// RestsUnder are the rests in force now of what rests by a key starting
+// with prefix — a subscription's accounts by "<provider>@", each its own
+// (provider@user) and each of its models' (provider@user/model) — with
+// Key, and Model for a model's, filled in, soonest back first. The
+// Providers page shows them on the account's row (maxleebeta on Discord:
+// WorkBuddy's 429 "将在 … 重置" rested a model with credits left, and
+// nothing there said so).
+func RestsUnder(prefix string) []Rest {
+	restingUntil.Lock()
+	defer restingUntil.Unlock()
+	now := time.Now()
+	var out []Rest
+	for k, until := range restingUntil.m {
+		if !strings.HasPrefix(k, prefix) || !now.Before(until) {
+			continue
+		}
+		r := restingUntil.note[k]
+		r.Key, r.Until = k, until
+		out = append(out, r)
+	}
+	slices.SortFunc(out, func(a, b Rest) int {
+		return cmp.Or(a.Until.Compare(b.Until), strings.Compare(a.Key, b.Key))
+	})
+	return out
+}
 
 // Unrest lifts the rest of what rests by key — an account just verified
 // with its vendor, say — so the next request asks it again: rate limited
@@ -1995,9 +2023,10 @@ type left struct {
 	due     time.Time   // when the window that pace went by renews; zero when not known
 	// restarts: when an auto-used reset starts its windows again
 	// (Allowance.Restarts), zero when none will; dueRestart: due is that,
-	// sooner than the window renews by itself
-	restarts   time.Time
-	dueRestart bool
+	// sooner than the window renews by itself; dueExpiry: due is when
+	// credits in it expire, sooner than it renews (Allowance.Pace)
+	restarts              time.Time
+	dueRestart, dueExpiry bool
 	// the count used is the share of, when the vendor counts it so
 	// (Allowance.Count): amount of of, in unit
 	amount, of float64
@@ -2086,6 +2115,7 @@ func weighRouted(p provider.Provider, cs []candidate, model string, from provide
 			rs := a.Restarts(now)
 			l := left{used: u, renews: r, fullest: a.Fullest(c.model, now), soon: a.Renewal(c.model, now), lapse: a.Lapse(c.model, now), pace: pc, due: due, amount: amt, of: of, unit: unit,
 				restarts: rs, dueRestart: !rs.IsZero() && due.Equal(rs), credits: spendsCredits(c.p, a)} // one not known counts as unused
+			l.dueExpiry = !l.dueRestart && !l.lapse.IsZero() && due.Equal(l.lapse)
 			l.first = l.credits && provider.CodexCreditsFirst(c.p.Account.User)
 			if b, bu, has := a.Left(c.model); has {
 				// a wallet's figure is weighed only against the same
