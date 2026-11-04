@@ -42,6 +42,12 @@ import (
 
 const fallbackCooldown = time.Minute
 
+// groupBudget is how long a group's serial walk may wait on members that
+// are slow to start, in all: below the 600s a client gives up at, so the
+// error comes from magpie and names the budget, and no member is blamed
+// for the client hanging up first (#5113). A var for tests.
+var groupBudget = 540 * time.Second
+
 type candidate struct {
 	p     provider.Provider
 	model string
@@ -2234,6 +2240,10 @@ type holdWriter struct {
 	// takes; slow says it took longer, and was let go with nothing sent
 	firstWait time.Duration
 	slow      bool
+	// budgeted says firstWait was cut to what was left of the walk's
+	// total time (groupBudget), so its running out is the budget's end,
+	// not this member being slow (#5113)
+	budgeted bool
 
 	// loop reads a streamed reply for a loop it won't leave (#1359), nil
 	// when Settings' NoLoopGuard is on or the agent asked for no stream;
@@ -2621,8 +2631,8 @@ func refusesAfterThinking(model string) bool {
 // deepseekAfterThinking tells whether the model is DeepSeek's, the one
 // vendor whose reasoning the refusal hold lets go once the member has
 // gone on from its thinking to an answer enough times running
-// (holdsThinking): Claude's, GPT's and Gemini's is held whatever the
-// member has answered lately (#248).
+// (holdsThinking) whether or not a refusal after it can be handed over:
+// Claude's, GPT's and Gemini's only where it can (#248, #4166).
 func deepseekAfterThinking(model string) bool {
 	m := strings.ToLower(model)
 	if i := strings.LastIndex(m, "/"); i >= 0 {
@@ -2632,8 +2642,8 @@ func deepseekAfterThinking(model string) bool {
 }
 
 // thoughtCleanMost is how many thinking replies in a row that went on to
-// an answer trust a DeepSeek member with its reasoning as it comes
-// (holdsThinking): its filter refuses after thinking hardly ever (#4512:
+// an answer trust a member with its reasoning as it comes
+// (holdsThinking): DeepSeek's filter refuses after thinking hardly ever (#4512:
 // one content_filter in 33,245 group requests over 7 days), and held,
 // every one of those requests kept the agent waiting its whole thinking
 // out. A refusal of its own takes the trust back (thoughtRefused).
@@ -2643,13 +2653,16 @@ const thoughtCleanMost = 3
 // refusal after it while another candidate could answer. DeepSeek's is,
 // until the member's thinking has gone on to an answer thoughtCleanMost
 // times running; past that it goes through as it comes, GLM's way.
-// Claude's, GPT's and Gemini's is held whatever the member answered
-// lately (#248).
-func (s *Server) holdsThinking(c candidate) bool {
+// Claude's, GPT's and Gemini's is trusted the same way only where a
+// refusal after it is handed to the next candidate in the same stream
+// (handsOver, refusalHandover), and is held whatever the member answered
+// lately where it isn't (#248): told to the agent, such a refusal would
+// end the turn with nothing said (#4166).
+func (s *Server) holdsThinking(c candidate, handsOver bool) bool {
 	if !refusesAfterThinking(c.model) {
 		return false
 	}
-	if !deepseekAfterThinking(c.model) {
+	if !deepseekAfterThinking(c.model) && !handsOver {
 		return true
 	}
 	s.thoughtMu.Lock()
@@ -2660,7 +2673,7 @@ func (s *Server) holdsThinking(c candidate) bool {
 // thoughtAnswered counts a thinking reply that went on to an answer, for
 // holdsThinking's trust to run out on.
 func (s *Server) thoughtAnswered(c candidate) {
-	if !deepseekAfterThinking(c.model) {
+	if !refusesAfterThinking(c.model) {
 		return
 	}
 	s.thoughtMu.Lock()
@@ -2676,7 +2689,7 @@ func (s *Server) thoughtAnswered(c candidate) {
 // is held again for the next requests, until it has answered
 // thoughtCleanMost times running.
 func (s *Server) thoughtRefused(c candidate) {
-	if !deepseekAfterThinking(c.model) {
+	if !refusesAfterThinking(c.model) {
 		return
 	}
 	s.thoughtMu.Lock()

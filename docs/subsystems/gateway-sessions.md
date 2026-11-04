@@ -8,7 +8,9 @@ with. The response returns that id in `X-Magpie-Session`; listed browser
 origins can read this header through CORS. magpie never makes up an id for a
 request without one, so such a request has no session and its text is not
 recorded: text kept under an id nothing lists couldn't be opened. Prompt text,
-caller keys and network addresses are never used to guess conversation ownership.
+caller keys and network addresses are never used to guess conversation ownership,
+with one exception, Qoder's below, where the prompt is matched against the
+session files the agent itself wrote.
 So the configs magpie writes have each agent name its session: Pi's provider
 block sets `compat.sendSessionAffinityHeaders` (`x-session-affinity` on Chat and
 Messages; Responses sends `session_id` anyway), and omp 16.0.6 and later gets
@@ -30,6 +32,29 @@ identify the current session. This lets Routing group requests by the same id
 the native WorkBuddy session reader already knows; old requests without a
 recorded session remain unnamed. See `TestWorkBuddySessionHeader`,
 `TestWorkBuddySessionThroughGateway` and `TestRemoteMagpieKeepsTheSession`.
+
+Qoder's CLI (qodercli, qoderclicn) named its session in `session-id` up to
+1.1.81; 1.1.82 sends no session at all (coderlee233 on Discord). For a request
+from Qoder or Qoder CN (by its agent token) on this computer that names no
+session, `qoderSession` ([`qoder_session.go`](../../internal/gateway/qoder_session.go))
+finds the session in Qoder's own folder (`sessions.QoderDir`): of the session
+files written in the last 24 hours (`projects/<project>/<id>.jsonl` and a
+recent one's `<id>/subagents/agent-*.jsonl`, whose lines name the parent
+session), the one whose typed prompts (`user` lines with `humanInput`, or
+`origin.kind` human) appear most in the request's user text, Qoder's
+`<system-reminder>` blocks left out; of equal ones, the file written last. A
+turn holds every prompt of its session, a subagent's turn the Agent tool's
+prompt, a title call the latest prompt or a transcript, a suggestion call
+"User: …". The id goes on the request as `session-id`, and in the caller
+passed to a remote magpie, so it is recorded, titled and grouped as 1.1.81's
+was. Files are read incrementally (whole lines only) and listed at most once
+a second, again at once when nothing matches; a side call (no tools) nothing
+matches is held up to 600 ms, since Qoder asks the first title as the prompt
+is sent, before it writes the file. A request that names a session is left as
+it came. Verification: `TestQoderRequestsFindTheirSession`,
+`TestQoderSamePromptTwoSessions`, `TestQoderFirstTitleBeforeItsFile`,
+`TestQoderSessionThroughGateway`, on qodercli 1.1.82's own requests and files
+(`testdata/qoder-1.1.82`).
 
 DSH names its session in `x-deepseek-harness-session-id`, read the same way
 after the others, and marks a request that compacts its context with
@@ -178,6 +203,11 @@ capabilities to a gateway row. Verification: `TestDesktopSessionTitles`,
 `TestDesktopSessionTitleInStats`, `TestDesktopTitlesReadOncePerList`,
 `TestDesktopSessionTitlesOnPages`.
 
+A ZCode request names its session without the `sess_` prefix ZCode's
+database gives it, so `Titles` looks a `zcode:` key up under both and
+answers under the id asked for (#5195). Verification:
+`TestZCodeTitlesByRequestID`.
+
 Routing's stage names the session an account is serving (connor_yang on
 Discord): a row answering, or that answered, the request shown adds that
 request's session title after its status, on one line cut short with the
@@ -196,6 +226,22 @@ changes it. A session with no title says nothing more, and
 neither does a Codex request whose parent was only matched by its prompt
 (`parentMatched`), since that match is a guess. Verification:
 `routing-session-title.test.cjs`.
+
+A By session head reads as its title (flandern1211_58540 on Discord: a
+folder and an id told nothing): the agent, then the session's title on one
+line (whitespace folded), then its folder in a quieter `.dir`; with no title
+the folder takes its place, and with neither the id. The tooltip keeps the
+title, the folder and the id. Where `sessions.Titles` and Codex's name index
+find nothing, the same endpoint falls back to the first prompt the gateway
+recorded for that session (`sessions.GatewayTitler`, the title its list
+shows), looked up under the agent the page names and the one the gateway
+records it under (`usage.AgentOf`): `withGatewayTitles` and
+`codexReadableTitles` in [`trace.go`](../../internal/gui/trace.go). Codex
+ids the index doesn't name go to `sessions.Titles` as `codex:` keys first,
+so a rollout's own first prompt names it. Nothing is read that the page
+couldn't already show on the Sessions page, and nothing leaves the local
+GUI. Verification: `TestSessionTitlesFallBackToFirstPrompt`,
+`routing-session-folder.test.cjs`.
 
 A gateway projection can be deleted (lc on Discord). `sessions.DeleteGateway`
 moves its recorded text folders (`gateway-conversations/<date>/<identity hash>`)
@@ -585,6 +631,10 @@ on Usage and Sessions both (`codexRolloutOf`, `codexCheckpointsOf` in
 are the head of the fork only: its first turn the parent never had (a
 `turn_id` of its own) ends them, so a call of the fork's own is counted
 even when its numbers are those of one the parent made after the fork.
+A `rollout-<n>` turn id is not a turn of the fork's own: codex-rs names
+a turn that has no id of its own that way (its canonicalizer for older
+rollouts, its thread-history builder), and a copied head can hold one
+the parent doesn't (`ownTurn`).
 The parent is
 looked for in the same Codex home, by the UUIDv7 day of its id, then
 every day, then `archived_sessions`; one not found leaves the fork read
