@@ -428,6 +428,9 @@ type fileMore struct {
 	// agy: what conversation_summaries.db says of the conversation
 	agy    *agySummary
 	editor *cursorEditorMeta
+	// loose: a Cursor editor transcript whose chat Cursor's editor keeps
+	// no longer, read from a store that could be read (or none)
+	loose bool
 	// wsl: the WSL distro whose home it is in
 	wsl string
 }
@@ -772,6 +775,10 @@ func distinctPaths(fs []file) []file {
 // Dirs are the folders the sessions are read from: Claude Code's and
 // Codex's, and the other agents' where they keep sessions on this computer.
 func Dirs() []string {
+	// gateway mode reads no folder here (OwnOff)
+	if ownOff() {
+		return nil
+	}
 	out := []string{ClaudeDir()}
 	out = append(out, CodexDirs()...)
 	var named []os.FileInfo
