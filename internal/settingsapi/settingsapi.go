@@ -46,7 +46,9 @@ var Keys = []string{
 	"workbuddyCheckin", "traeCheckin", "minimaxCheckin", "qoderCheckin",
 	// models: replies, vision, images, search
 	"replyModel", "noLoopGuard", "claudeLeanPrompt", "claudePrintMode", "refusalRetries", "retryAfterCap",
-	"vision", "visionEffort", "imageGen", "imageTimeout", "classifyTimeout",
+	"vision", "visionEffort", "imageGen", "videoGen", "imageTimeout", "classifyTimeout",
+	// what every routing group does that says nothing of its own
+	"groupSink", "groupFirstToken", "groupPatience",
 	"searcher", "searcherThen", "searcherEffort", "searchFirst",
 	// updates
 	"noUpdatePill", "noAutoUpdate", "updateEvery", "noAutoDownload", "autoRestart", "updateChannel",
@@ -204,12 +206,27 @@ func Merge(body []byte, cur settings.Settings, web bool) (settings.Settings, err
 		in.RedactShape = cur.RedactShape
 	}
 	// nor how long an image is given to be drawn
+	// nor the video model, picked in its own row
+	if _, sent := fields["videoGen"]; !sent {
+		in.VideoGen = cur.VideoGen
+	}
 	if _, sent := fields["imageTimeout"]; !sent {
 		in.ImageTimeout = cur.ImageTimeout
 	}
 	// nor how long a routing group's classifier is given (#2934)
 	if _, sent := fields["classifyTimeout"]; !sent {
 		in.ClassifyTimeout = cur.ClassifyTimeout
+	}
+	// nor what every routing group does that says nothing of its own,
+	// which the Routing groups page sets (jiezhengj on Discord)
+	if _, sent := fields["groupSink"]; !sent {
+		in.GroupSink = cur.GroupSink
+	}
+	if _, sent := fields["groupFirstToken"]; !sent {
+		in.GroupFirstToken = cur.GroupFirstToken
+	}
+	if _, sent := fields["groupPatience"]; !sent {
+		in.GroupPatience = cur.GroupPatience
 	}
 	// nor whether animations are stilled (#3813)
 	if _, sent := fields["reduceMotion"]; !sent {
@@ -320,6 +337,8 @@ func Merge(body []byte, cur settings.Settings, web bool) (settings.Settings, err
 	in.CodexAsyncCompact, in.CodexAsyncCompactPercent = cur.CodexAsyncCompact, cur.CodexAsyncCompactPercent
 	// Claude Desktop's list, set in its row on the Agents page
 	in.DesktopLongest = cur.DesktopLongest
+	// and whether it runs in a folder of its own, set there too (#5671)
+	in.DesktopIsolated = cur.DesktopIsolated
 	// and the Get started card put away, from the card itself
 	in.GuideHidden = cur.GuideHidden
 
@@ -371,6 +390,9 @@ func Merge(body []byte, cur settings.Settings, web bool) (settings.Settings, err
 		if _, _, ok := provider.Resolve(v); !ok {
 			return in, fmt.Errorf("no model %s to generate images", v)
 		}
+	}
+	if v := strings.TrimSpace(in.VideoGen); v != "" && v != cur.VideoGen && gateway.VideomakerMissingOf(v) != "" {
+		return in, fmt.Errorf("no model %s to make videos", v)
 	}
 	// the searchers after the one named, set in their own row: a save
 	// that doesn't send them (prefsKeep has none) keeps them, and an

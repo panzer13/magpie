@@ -5,6 +5,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -69,6 +70,9 @@ type place struct {
 	// dir is the agent's config folder when magpie keeps one of its own
 	// for it (claude-magpie's launch file, claude_launch.go); "": its own
 	dir string
+	// wsl is the distro of an agent there, for one magpie runs there
+	// itself (Claude Science's daemon); nil on this machine
+	wsl *distro
 }
 
 func here(home string) place { return place{home: home} }
@@ -396,7 +400,7 @@ func (d distro) place(id string) place {
 		kind = k
 	}
 	return place{home: d.local(d.Home), id: id, spell: d.native, sys: d.local, base: d.base, cold: !d.Running, version: d.Versions[kind],
-		reach: d.open, unreached: new(error), chmod: d.chmod}
+		reach: d.open, unreached: new(error), chmod: d.chmod, wsl: &d}
 }
 
 // chmod takes the group's and others' bits off local, a file in the distro
@@ -435,9 +439,15 @@ type wslKind struct {
 	// asleep, when set, is a stopped distro's options for a field, which
 	// must read nothing of its files; nil keeps the live agent's
 	asleep func(key string) func(map[string]string) []Option
+	// ownNotice keeps the agent's own notice: one that reaches the gateway
+	// under NAT by a way of its own (Claude Science's relay)
+	ownNotice bool
 }
 
 var wslKinds = []wslKind{
+	// its daemon, which magpie starts there itself (claudescience_wsl.go):
+	// the probe looks in ~/.local/bin, where its installer puts it
+	{id: ScienceID, name: scienceName, dir: ".claude-science", bin: "claude-science", in: scienceIn, ownNotice: true},
 	{id: "codex", name: "Codex", dir: ".codex", bin: "codex", in: codexIn,
 		restart: newNotice("{agent} in WSL {distro} builds its model list at start-up — restart it, the app-server its sessions share ({command} there) and the Codex app's WSL connection to see this."),
 		asleep: func(key string) func(map[string]string) []Option {
@@ -904,7 +914,11 @@ func wslAgent(k wslKind, d distro) *Agent {
 	// its requests carry the agent's User-Agent and are counted as its
 	// Windows twin's, so a prompt with none of "its" own seen isn't a bypass
 	a.LastUsed = nil
+	own := a.Notice
 	a.Notice = func() string {
+		if k.ownNotice && own != nil {
+			return own()
+		}
 		if !d.Mirrored {
 			return d.notMirrored(k.name)
 		}
@@ -1276,7 +1290,10 @@ var wslRun = func(timeout time.Duration, args ...string) ([]byte, error) {
 	cmd := proc.CommandContext(ctx, "wsl.exe", args...)
 	// wsl.exe speaks UTF-16 unless told otherwise; either is read
 	cmd.Env = append(os.Environ(), "WSL_UTF8=1")
-	return cmd.Output()
+	out, err := cmd.Output()
+	// one that says WSL must be updated isn't run again for hours
+	proc.WSLSaid(out, err)
+	return out, err
 }
 
 // wslRoot is where magpie opens a running distro's / from; a var for tests.
@@ -1608,9 +1625,15 @@ func wslCodexStandIn() string {
 }
 
 // wslList is the names wsl.exe lists with args; ok is false when it
-// couldn't say (no WSL, or none installed).
+// couldn't say (no WSL, or none installed). With no distro registered at
+// all wsl.exe isn't run (proc.ErrNoWSLDistro), and that is an answer:
+// none. One refused while WSL asks to be updated is not, so nothing
+// remembered of a distro is forgotten for it.
 func wslList(args ...string) (names []string, ok bool) {
 	b, err := wslRun(10*time.Second, args...)
+	if errors.Is(err, proc.ErrNoWSLDistro) {
+		return nil, true
+	}
 	if err != nil {
 		return nil, false
 	}

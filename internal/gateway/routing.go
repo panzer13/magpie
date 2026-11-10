@@ -829,6 +829,11 @@ type Rest struct {
 	// asked, it answers from its own hold at once, or from what it serves
 	// now
 	there bool
+	// out, outHeader: a ChatGPT account's refusal as the backend gave it
+	// (codexOutRefusal) and its x-codex-* windows, for a turn held on it
+	// (timedHeld) to be told as Codex is told on its own sign-in
+	out       []byte
+	outHeader http.Header
 }
 
 // asksAt is when r, a key's rest out of its allowance or credit, has it
@@ -869,6 +874,9 @@ func renewed(agent, user string) {
 // stands started again in fact, or a reset was spent.
 func restarted(agent, user string) {
 	liftRests(agent, user, true)
+	if agent == "codex" {
+		liftCodexHold(user)
+	}
 }
 
 // liftRests lifts an account's rests out of quota, or of a window read
@@ -1478,6 +1486,15 @@ func (s *Server) restAfterMarked(c candidate, status int, header http.Header, bo
 		// the vendor's words, for quotaHeld to give again
 		r.said = provider.APIError(body, http.StatusText(status))
 	}
+	if codexOutRefusal(c.p, provider.Responses, status, body) {
+		r.out = append([]byte(nil), body...)
+		r.outHeader = http.Header{}
+		for k, vs := range header {
+			if strings.HasPrefix(strings.ToLower(k), "x-codex-") {
+				r.outHeader[k] = slices.Clone(vs)
+			}
+		}
+	}
 	switch why {
 	case failCredit:
 		d, r.By, guessed = creditRest, "credit", true
@@ -1722,6 +1739,10 @@ func (s *Server) restAfterMarked(c candidate, status int, header http.Header, bo
 	if why == failQuota && zcodeTrialRefused(c, status, body) {
 		id = c.restID()
 	}
+	// and so is its 3012: zcode.z.ai's, not the GLM Coding Plan's host's
+	if zcodeTrialRestricted(c, why) {
+		id = c.restID()
+	}
 	// a relay's 429 that names the model whose credentials cooled down is
 	// that model's: its siblings on the same key still answer upstream,
 	// and the model's own sentence rests with the model, not on every
@@ -1916,6 +1937,13 @@ func backingOff(key string, now time.Time) bool {
 	return ok && now.Before(until) && restingUntil.note[key].Why == failOther
 }
 
+// vendorSaidWhen says whether a 429's headers or body name a time it is
+// limited till, as rateRest reads them.
+func vendorSaidWhen(header http.Header, body []byte) bool {
+	now := time.Now()
+	return max(retryAfter(header, now), resetsNoted(header, now), resetsAt(body, now)) > 0
+}
+
 // rateRest is how long a rate-limited candidate sits out: as long as the
 // vendor says (Retry-After, a reset header or a reset time in its error),
 // and a minute when it says nothing. One limited again as soon as its rest
@@ -1970,10 +1998,12 @@ func (s *Server) rateRest(c candidate, header http.Header, body []byte, sharedPo
 // (usedShare), except In order: there an account at 98% is still tried in
 // its turn, and one that fails then isn't benched until its week renews
 // unless the vendor said it was out (#530). A Codex account that goes on
-// on its credits is never: a window used up doesn't stop it (onCredits).
+// on its credits is never: a window used up doesn't stop it (onCredits);
+// nor is a key whose vendor goes on past its windows on a balance it
+// holds (Kimi Code's booster, #5721).
 func (c candidate) full(now time.Time) time.Time {
 	a, _ := c.allowance()
-	if spendsCredits(c.p, a) {
+	if spendsCredits(c.p, a) || c.p.Account == nil && a.OnCredits() {
 		return time.Time{}
 	}
 	return a.Full(c.model, provider.SpentShareOf(c.p.Routing), now)
@@ -2090,6 +2120,19 @@ func keepRetryOut(dst, src http.Header, body []byte) {
 // keyLimitThereHeader carries, from keepRetry to restAfter, that another
 // magpie refused with its gateway key's own limit (remoteKeyLimitHeader).
 const keyLimitThereHeader = "X-Magpie-Key-Limit-There"
+
+// routedThere says a failure was another magpie's (a Remote magpie's)
+// answer after its own routing had its turn: its same-one retries, its
+// patience and its group's other members, which it was asked in full
+// (answeredThereHeader). Asked again from here, every one of them ran
+// again: one agent request sent the vendor 35 asks over 174s where the
+// remote alone would have made 7 over 33s (YeYaka88 on X). It isn't asked
+// again by this magpie's same-one retries or patience; this magpie's own
+// other members still are, and a remote that couldn't be reached, or
+// refused before routing (its key, its limit), is asked again as before.
+func routedThere(header http.Header) bool {
+	return header.Get(answeredThereHeader) != ""
+}
 
 // answeredThereHeader carries, from keepRetry to restAfter, the provider
 // another magpie named on its refusal (providerHeader): the refusal is
@@ -2234,9 +2277,12 @@ type left struct {
 	// (Allowance.Fullest), zero when not known
 	fullest time.Time
 	soon    []time.Time // renews as Smart ranks them (Allowance.Renewal)
-	lapse   time.Time   // when the soonest of what is left is lost (Allowance.Lapse)
-	pace    float64     // weekly pace: share of its week left per hour until it renews
-	due     time.Time   // when the window that pace went by renews; zero when not known
+	// unreached: how many of soon's windows Smart passes over, as they
+	// can't be used up before they renew any more (Allowance.Unreached)
+	unreached int
+	lapse     time.Time // when the soonest of what is left is lost (Allowance.Lapse)
+	pace      float64   // weekly pace: share of its week left per hour until it renews
+	due       time.Time // when the window that pace went by renews; zero when not known
 	// restarts: when an auto-used reset starts its windows again
 	// (Allowance.Restarts), zero when none will; dueRestart: due is that,
 	// sooner than the window renews by itself; dueExpiry: due is when
@@ -2353,7 +2399,7 @@ func weighRouted(p provider.Provider, cs []candidate, model string, from provide
 			pc, due := a.Pace(c.model, now)
 			amt, of, unit := a.Count(c.model, now)
 			rs := a.Restarts(now)
-			l := left{used: u, renews: r, fullest: a.Fullest(c.model, now), soon: a.Renewal(c.model, now), lapse: a.Lapse(c.model, now), pace: pc, due: due, amount: amt, of: of, unit: unit,
+			l := left{used: u, renews: r, fullest: a.Fullest(c.model, now), soon: a.Renewal(c.model, now), unreached: a.Unreached(c.model, now), lapse: a.Lapse(c.model, now), pace: pc, due: due, amount: amt, of: of, unit: unit,
 				restarts: rs, dueRestart: !rs.IsZero() && due.Equal(rs), credits: spendsCredits(c.p, a)} // one not known counts as unused
 			l.dueExpiry = !l.dueRestart && !l.lapse.IsZero() && due.Equal(l.lapse)
 			l.weekLow = u >= lowShare && u < usedShare && a.CapUsed(c.model, now) < lowShare
@@ -2384,7 +2430,7 @@ func weighRouted(p provider.Provider, cs []candidate, model string, from provide
 			pace = provider.FreshPace
 		}
 		seats[i] = routes.Seat{Key: c.rest, Account: c.p.Account != nil, Known: known, Learns: learns(c, wg.lefts),
-			Used: l.used, WeekLow: l.weekLow, Soon: l.soon, Lapse: l.lapse, Pace: pace, Weight: keyWeight(c), Resting: resting(c), Tokens: routed.used[c.restKey()].now(now), Credits: l.credits, First: l.first,
+			Used: l.used, WeekLow: l.weekLow, Soon: l.soon, Unreached: l.unreached, Lapse: l.lapse, Pace: pace, Weight: keyWeight(c), Resting: resting(c), Tokens: routed.used[c.restKey()].now(now), Credits: l.credits, First: l.first,
 			Left: l.bal, LeftIn: l.balIn, Spent: spentRest(c), Lead: c.p.UseFirst}
 	}
 	routed.Unlock()

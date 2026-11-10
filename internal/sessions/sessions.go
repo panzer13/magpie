@@ -20,6 +20,7 @@ import (
 	"io/fs"
 	"maps"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -166,6 +167,19 @@ type Session struct {
 	// so a reply id that names the fork is taken over the opening only for
 	// a fork of the opening's session (gui's ownerOf)
 	ForkOf string `json:"-"`
+	// SeedConvs are the conversation ids the fork's copied events opened
+	// (dshConvs), which its seed's end takes off Convs: the source's
+	// opening is what a fork and its source share, and dsh's current
+	// forks write no parentSession to say so, so this is how the fork's
+	// own replies are known to belong to a fork of that opening
+	// (gui's ownerOf)
+	SeedConvs []string `json:"-"`
+	// TurnConvs are the ids of its newest turn's user messages, one
+	// spelling each and the newest dshTurnKept at most: a request still
+	// answering has no reply id yet, and the messages it carried — in
+	// this session's file before it went out — say which branch it is of
+	// (gui's ownerLast)
+	TurnConvs []string `json:"-"`
 	// Copies are the ids of the sessions that are copies of its
 	// conversation, not listed apart from it (ccCopies)
 	Copies []string `json:"-"`
@@ -200,27 +214,62 @@ const All = 5000
 // state is what one file's parse has come to, enough to read on from Off.
 type state struct {
 	// the agent whose file it is, for its parseVersions
-	Agent                 string            `json:"agent,omitempty"`
-	Codex                 *codexUsageState  `json:"-"`
-	codexPath             string            // the rollout read, for its fork's parent
-	Claude                *claudeUsageState `json:"claude,omitempty"`
+	Agent     string            `json:"agent,omitempty"`
+	Codex     *codexUsageState  `json:"-"`
+	codexPath string            // the rollout read, for its fork's parent
+	Claude    *claudeUsageState `json:"claude,omitempty"`
+	Head      string            `json:"head,omitempty"`
+	// int32 beside CdRead: the head is headLen bytes at most, and the 8 bytes
+	// it saves take a state from the 448-byte size class to 416 (#2278)
+	HeadSize int32 `json:"head_size,omitempty"`
+	// Claude Code: parsed by a magpie that reads /cd's relocated lines
+	// (ccRelocated), so Cwd is the folder the session was last moved to
+	CdRead        bool           `json:"cd_read,omitempty"`
+	ContentHash   string         `json:"content_hash,omitempty"`
+	Size          int64          `json:"size"`
+	Mod           int64          `json:"mod"` // unix nanoseconds
+	Off           int64          `json:"off"` // after the last whole line read
+	ID            string         `json:"id,omitempty"`
+	CodexIdentity *CodexIdentity `json:"codex_identity,omitempty"`
+	Cwd           string         `json:"cwd,omitempty"`
+	Title         string         `json:"title,omitempty"`
+	Start         time.Time      `json:"start"`
+	Last          time.Time      `json:"last"`
+	Models        named[Tokens]  `json:"models,omitempty"`
+	// Days is Models again, split by the local date each message was
+	// written on: a session that runs past midnight counts on both days.
+	Days named[*day] `json:"days,omitempty"`
+	// Claude Code: the entrypoint its first line naming one says, which
+	// tells a session Claude Desktop's Code tab ran (desktopEntrypoint)
+	Entry string `json:"entry,omitempty"`
+	// Claude Code: the message last counted, whose later lines repeat it,
+	// and the day it was counted on
+	Msg      string `json:"msg,omitempty"`
+	MsgModel string `json:"msg_model,omitempty"`
+	MsgUse   Tokens `json:"msg_use"`
+	MsgDay   string `json:"msg_day,omitempty"`
+	// Codex: the model in use, and its running total (input with cache) last seen
+	Model string  `json:"model,omitempty"`
+	Total *Tokens `json:"total,omitempty"`
+	// Codex: the model_provider its session_meta names (codex_provider.go)
+	Provider string `json:"provider,omitempty"`
+	// what few files have, nil for a file with none of it (StateMore)
+	*StateMore
+}
+
+// StateMore is what only some files' state has. A history's every file is
+// kept parsed, and these fields were ~330 of each state's 760 bytes, held
+// empty by nearly all of them: ~6 MB of 18k files' states (#2278). It is
+// embedded so the cache's JSON keeps its keys; a read through a state goes
+// through more() and a write through own(), as a nil one has no fields.
+type StateMore struct {
 	DBRevision            string            `json:"db_revision,omitempty"`
-	Head                  string            `json:"head,omitempty"`
-	HeadSize              int               `json:"head_size,omitempty"`
-	ContentHash           string            `json:"content_hash,omitempty"`
-	Size                  int64             `json:"size"`
-	Mod                   int64             `json:"mod"` // unix nanoseconds
-	Off                   int64             `json:"off"` // after the last whole line read
-	ID                    string            `json:"id,omitempty"`
-	CodexIdentity         *CodexIdentity    `json:"codex_identity,omitempty"`
 	CodexIdentityConflict bool              `json:"codex_identity_conflict,omitempty"`
 	CodexNickname         string            `json:"codex_nickname,omitempty"`
 	CodexSpawnNames       map[string]string `json:"codex_spawn_names,omitempty"`
 	CodexSpawnConflicts   map[string]bool   `json:"codex_spawn_conflicts,omitempty"`
 	CodexAgentIDs         map[string]string `json:"codex_agent_ids,omitempty"`
 	CodexAgentConflicts   map[string]bool   `json:"codex_agent_conflicts,omitempty"`
-	Cwd                   string            `json:"cwd,omitempty"`
-	Title                 string            `json:"title,omitempty"`
 	Named                 string            `json:"named,omitempty"`  // the agent's own title for it
 	Custom                string            `json:"custom,omitempty"` // the name the user gave it
 	First                 string            `json:"first,omitempty"`  // the first message, when no prompt looked typed
@@ -229,25 +278,16 @@ type state struct {
 	// gateway wrote them on its routes and the agent kept them with the
 	// reply (dsh's replay state): they name a request after the fact, where
 	// a conversation id is only its opening (Route.ResponseID)
-	ResponseIDs []string      `json:"response_ids,omitempty"`
-	Start       time.Time     `json:"start"`
-	Last        time.Time     `json:"last"`
-	Models      named[Tokens] `json:"models,omitempty"`
-	// Days is Models again, split by the local date each message was
-	// written on: a session that runs past midnight counts on both days.
-	Days named[*day] `json:"days,omitempty"`
-	// Claude Code: the entrypoint its first line naming one says, which
-	// tells a session Claude Desktop's Code tab ran (desktopEntrypoint)
-	Entry string `json:"entry,omitempty"`
-	// Claude Code: parsed by a magpie that reads /cd's relocated lines
-	// (ccRelocated), so Cwd is the folder the session was last moved to
-	CdRead bool `json:"cd_read,omitempty"`
-	// Claude Code: the message last counted, whose later lines repeat it,
-	// and the day it was counted on
-	Msg      string `json:"msg,omitempty"`
-	MsgModel string `json:"msg_model,omitempty"`
-	MsgUse   Tokens `json:"msg_use"`
-	MsgDay   string `json:"msg_day,omitempty"`
+	ResponseIDs []string `json:"response_ids,omitempty"`
+	// SeedConvs are the conversation ids a fork's copied events opened
+	// (dshConvs), kept when its seed's end takes them off Convs: the
+	// opening a fork and its source share is the source's, and this is
+	// the fork's own record that it came from that opening (ownerSeed)
+	SeedConvs []string `json:"seed_convs,omitempty"`
+	// TurnConvs are the ids of its newest turn's user messages (the first
+	// of dshConvs each, the newest dshTurnKept), reset at the turn's start
+	// and not kept from a fork's seed (gui's ownerLast)
+	TurnConvs []string `json:"turn_convs,omitempty"`
 	// Claude Code: the uuids of the first and the last message of the
 	// file's own conversation (ccLink)
 	Root string `json:"root,omitempty"`
@@ -256,11 +296,6 @@ type state struct {
 	// /rewind's summarize) left in the file. A copy made after one starts
 	// with that summary, so its Root is one of these (ccCopies).
 	Compacts []string `json:"compacts,omitempty"`
-	// Codex: the model in use, and its running total (input with cache) last seen
-	Model string  `json:"model,omitempty"`
-	Total *Tokens `json:"total,omitempty"`
-	// Codex: the model_provider its session_meta names (codex_provider.go)
-	Provider string `json:"provider,omitempty"`
 	// Pi: in a forked session, the time it was forked; the lines before
 	// it are the copy of the session it was forked from
 	Since time.Time `json:"since,omitzero"`
@@ -282,6 +317,43 @@ type state struct {
 	Cline *clineCarry `json:"cline,omitempty"`
 }
 
+// noMore is what more gives for a state with none: read, never written.
+var noMore StateMore
+
+// more is s's StateMore to read: an empty one when s has none.
+func (s *state) more() *StateMore {
+	if s.StateMore != nil {
+		return s.StateMore
+	}
+	return &noMore
+}
+
+// own is s's StateMore to write, made when s has none.
+func (s *state) own() *StateMore {
+	if s.StateMore == nil {
+		s.StateMore = &StateMore{}
+	}
+	return s.StateMore
+}
+
+// moreOf is m to embed in a state: nil when it holds nothing.
+func moreOf(m StateMore) *StateMore {
+	if m.zero() {
+		return nil
+	}
+	return &m
+}
+
+// zero: m holds nothing a state would keep (TestStateMoreZeroKnowsEveryField).
+func (m *StateMore) zero() bool {
+	return m == nil || m.DBRevision == "" && !m.CodexIdentityConflict && m.CodexNickname == "" &&
+		len(m.CodexSpawnNames) == 0 && len(m.CodexSpawnConflicts) == 0 && len(m.CodexAgentIDs) == 0 &&
+		len(m.CodexAgentConflicts) == 0 && m.Named == "" && m.Custom == "" && m.First == "" &&
+		len(m.Convs) == 0 && len(m.ResponseIDs) == 0 && len(m.SeedConvs) == 0 && len(m.TurnConvs) == 0 &&
+		m.Root == "" && m.Leaf == "" && len(m.Compacts) == 0 && m.Since.IsZero() &&
+		m.Grok == nil && m.Droid == nil && m.Kimi == nil && m.Agy == nil && m.Dsh == nil && m.Cline == nil
+}
+
 // day is one local date's share of a file: tokens by model, and the time
 // the session was at work on it.
 type day struct {
@@ -293,8 +365,8 @@ type day struct {
 	// it runs while its session's own file goes on.
 	Active int64 `json:"a,omitempty"`
 	// Hours is Active again, by the local hour of the day it was put on
-	// (24 of them, or none)
-	Hours []int64 `json:"h,omitempty"`
+	// (only the hours that have some, or none; 24 numbers in the cache)
+	Hours hours `json:"h,omitempty"`
 	// Prompts are the messages typed in the session's own file, Replies
 	// the agent's messages back (Claude Code's, Codex's, Pi's and omp's)
 	Prompts int `json:"u,omitempty"`
@@ -305,9 +377,18 @@ type day struct {
 	Skills named[int] `json:"k,omitempty"`
 }
 
+// routerSkill is the one skill magpie's skill router gives an agent
+// (library.RouterSkill). Calling it up only lists the skills behind it,
+// and the one the agent then reads is counted (routedSkill), so it isn't
+// counted as a skill of its own: every routed use would be counted twice.
+const routerSkill = "magpie-skills"
+
 // tool counts a call of a tool, and of a skill when it calls one up; a
 // skill called up with no tool (Pi's /skill:name) has no name.
 func (s *state) tool(at time.Time, name, skill string) {
+	if skill == routerSkill {
+		skill = ""
+	}
 	if name == "" && skill == "" {
 		return
 	}
@@ -318,6 +399,23 @@ func (s *state) tool(at time.Time, name, skill string) {
 	if skill != "" {
 		*d.Skills.at(skill)++
 	}
+}
+
+// routedSkill is the skill a read of path calls up through magpie's
+// skill router (library's skill_router.go): an agent given magpie-skills
+// reads a skill's SKILL.md under magpie-skills/.skills/<name>/ with its
+// file tool, not its Skill tool. "" for any other path.
+func routedSkill(path string) string {
+	p := strings.ReplaceAll(path, `\`, "/")
+	rest, ok := strings.CutSuffix(p, "/SKILL.md")
+	if !ok {
+		return ""
+	}
+	dir, name := pathpkg.Split(rest)
+	if name == "" || !strings.HasSuffix(dir, "/"+routerSkill+"/.skills/") {
+		return ""
+	}
+	return name
 }
 
 // idleGap is the longest pause between two lines still counted as work.
@@ -373,10 +471,7 @@ func (s *state) saw(t time.Time, main bool) {
 		if gap := t.Sub(s.Last); main && !s.Last.IsZero() && gap < idleGap {
 			d := s.day(dateOf(t))
 			d.Active += gap.Milliseconds()
-			if d.Hours == nil {
-				d.Hours = make([]int64, 24)
-			}
-			d.Hours[t.In(time.Local).Hour()] += gap.Milliseconds()
+			d.Hours.add(t.In(time.Local).Hour(), gap.Milliseconds())
 		}
 		s.Last = t
 	}
@@ -387,24 +482,29 @@ func (s *state) clone() *state {
 	c.Codex = s.Codex.clone()
 	c.Claude = s.Claude.clone()
 	c.Models = slices.Clone(s.Models)
-	c.Compacts = slices.Clone(s.Compacts)
 	if s.Total != nil {
 		t := *s.Total
 		c.Total = &t
 	}
-	c.Convs = slices.Clone(s.Convs)
-	c.ResponseIDs = slices.Clone(s.ResponseIDs)
-	c.CodexSpawnNames = maps.Clone(s.CodexSpawnNames)
-	c.CodexSpawnConflicts = maps.Clone(s.CodexSpawnConflicts)
-	c.CodexAgentIDs = maps.Clone(s.CodexAgentIDs)
-	c.CodexAgentConflicts = maps.Clone(s.CodexAgentConflicts)
+	// its own StateMore: c := *s shares s's
+	if m := s.StateMore; m != nil {
+		cm := *m
+		cm.Compacts = slices.Clone(m.Compacts)
+		cm.Convs = slices.Clone(m.Convs)
+		cm.ResponseIDs = slices.Clone(m.ResponseIDs)
+		cm.SeedConvs = slices.Clone(m.SeedConvs)
+		cm.TurnConvs = slices.Clone(m.TurnConvs)
+		cm.CodexSpawnNames = maps.Clone(m.CodexSpawnNames)
+		cm.CodexSpawnConflicts = maps.Clone(m.CodexSpawnConflicts)
+		cm.CodexAgentIDs = maps.Clone(m.CodexAgentIDs)
+		cm.CodexAgentConflicts = maps.Clone(m.CodexAgentConflicts)
+		c.StateMore = &cm
+	}
 	c.Days = slices.Clone(s.Days)
 	for i, e := range c.Days {
 		v := e.v
 		d := &day{Active: v.Active, Models: slices.Clone(v.Models), Prompts: v.Prompts, Replies: v.Replies}
-		if v.Hours != nil {
-			d.Hours = append([]int64(nil), v.Hours...)
-		}
+		d.Hours = slices.Clone(v.Hours)
 		d.Tools, d.Skills = slices.Clone(v.Tools), slices.Clone(v.Skills)
 		c.Days[i].v = d
 	}
@@ -548,7 +648,7 @@ func statFiles(files []file, follow bool) []file {
 				return
 			}
 			if s.Mode == 0 {
-				f.size, f.mod, ok[i] = s.Size, s.Mod, true
+				f.size, f.mod, ok[i] = s.Size, s.ModTime(), true
 				return
 			}
 		}
@@ -832,6 +932,8 @@ func Dirs() []string {
 		{AlmaDir(), almaDB()},
 		{MiniMaxDir(), minimaxSessions()},
 		{KimiCodeDir(), kimiSessions()},
+		{AntigravityAppDir(), antigravityConversations()},
+		{AntigravityInsidersDir(), filepath.Join(AntigravityInsidersDir(), "conversations")},
 		{AgyDir(), filepath.Join(AgyDir(), "brain")},
 	} {
 		if _, err := os.Stat(d.sessions); err != nil {
@@ -1062,12 +1164,12 @@ func listedRollouts(root string) (out []file, ok bool) {
 				}
 				if len(seen) > 0 && filepath.Base(seen[0].path) == name {
 					f := seen[0]
-					f.size, f.mod = e.Size, e.Mod
+					f.size, f.mod = e.Size, e.ModTime()
 					out = append(out, f)
 					continue
 				}
 				if m := rolloutName.FindStringSubmatch(name); m != nil {
-					out = append(out, file{agent: "codex", key: "codex:" + m[1], path: filepath.Join(shown, name), main: true, size: e.Size, mod: e.Mod})
+					out = append(out, file{agent: "codex", key: "codex:" + m[1], path: filepath.Join(shown, name), main: true, size: e.Size, mod: e.ModTime()})
 					made = true
 				}
 			}
@@ -1163,11 +1265,17 @@ const cacheVersion = 29
 // dsh 1: the ids of the replies its own requests got (ResponseIDs), for
 // the routes that carry no session id and an opening a fork copies.
 //
+// dsh 2: the openings a fork's seed opened (SeedConvs), which its end
+// takes off Convs: a fork dsh writes today names no parentSession, so its
+// own replies are told from its source's by them.
+//
 // antigravity 1: a Gemini deployment's name with any one letter after it
 // (gemini-4-argon-d) is its model's (GeminiDeployment), not -n alone.
 // antigravity 2: a conversation's folder is its summary row's workspace
 // (a parse kept from before has none, under the same row revision).
-var parseVersions = map[string]int{"codex": 3, "zcode": 1, "dsh": 1, "antigravity": 2}
+// dsh 3: the ids of its newest turn's messages (TurnConvs), which a
+// request still answering carried and has no reply id for yet.
+var parseVersions = map[string]int{"codex": 3, "zcode": 1, "dsh": 3, "antigravity": 2}
 
 type cacheFile struct {
 	Version int    `json:"version"`
@@ -1366,7 +1474,7 @@ func refresh(want, all []file) {
 		if f.cold {
 			continue // in a stopped WSL distro: what was read of it stands
 		}
-		if s := parsed(f.path); s == nil || s.Size != f.size || s.Mod != f.mod.UnixNano() || ccStale(f, s) || (f.agent == "hermes" && (f.m().hermes == nil || f.m().rev == "" || s.DBRevision != f.m().rev)) || ((f.agent == "alma" || f.agent == "cursor" || f.agent == "agy" || f.agent == "antigravity") && s.DBRevision != f.m().rev) {
+		if s := parsed(f.path); s == nil || s.Size != f.size || s.Mod != f.mod.UnixNano() || ccStale(f, s) || (f.agent == "hermes" && (f.m().hermes == nil || f.m().rev == "" || s.more().DBRevision != f.m().rev)) || ((f.agent == "alma" || f.agent == "cursor" || f.agent == "agy" || f.agent == "antigravity") && s.more().DBRevision != f.m().rev) {
 			if parsing[f.path] != nil {
 				// a refresh is reading it, another or this one (a path
 				// listed twice): its last parse stands until that one is
@@ -1864,26 +1972,28 @@ func assembleListed(fs []file, price func(string) *catalog.Price, codexTitle fun
 			if s.Title == "" {
 				s.Title = st.Title
 			}
-			if st.Named != "" {
-				named = st.Named
+			if st.more().Named != "" {
+				named = st.more().Named
 			}
-			if st.Custom != "" {
-				custom = st.Custom
+			if st.more().Custom != "" {
+				custom = st.more().Custom
 			}
 			if first == "" {
-				first = st.First
+				first = st.more().First
 			}
 			if s.Agent == "claude" && s.App == "" && desktopEntrypoint(st.Entry) {
 				s.App = "claude-desktop"
 			}
-			s.Convs = append(s.Convs, st.Convs...)
-			s.ResponseIDs = append(s.ResponseIDs, st.ResponseIDs...)
-			if d := st.Dsh; d != nil && d.Head.IsSeeded && d.Head.DelegationDepth == 0 {
+			s.Convs = append(s.Convs, st.more().Convs...)
+			s.ResponseIDs = append(s.ResponseIDs, st.more().ResponseIDs...)
+			s.SeedConvs = append(s.SeedConvs, st.more().SeedConvs...)
+			s.TurnConvs = append(s.TurnConvs, st.more().TurnConvs...)
+			if d := st.more().Dsh; d != nil && d.Head.IsSeeded && d.Head.DelegationDepth == 0 {
 				s.ForkOf = d.Head.ParentSession
 			}
 		}
-		if s.Agent == "codex" && st.CodexNickname != "" {
-			s.Nickname = st.CodexNickname
+		if s.Agent == "codex" && st.more().CodexNickname != "" {
+			s.Nickname = st.more().CodexNickname
 		}
 		if !st.Start.IsZero() && (s.Start.IsZero() || st.Start.Before(s.Start)) {
 			s.Start = st.Start
@@ -1993,6 +2103,14 @@ func parse(f file, old *state) *state { return parseWith(f, old, nil) }
 // parseWith is parse with calls, when not nil, reading the file's calls on
 // the same pass.
 func parseWith(f file, old *state, calls *callsRide) *state {
+	s := parseRead(f, old, calls)
+	if s != nil && s.StateMore.zero() {
+		s.StateMore = nil // only empty values were written through own()
+	}
+	return s
+}
+
+func parseRead(f file, old *state, calls *callsRide) *state {
 	defer func() {
 		if calls != nil {
 			calls.release()
@@ -2020,13 +2138,13 @@ func parseWith(f file, old *state, calls *callsRide) *state {
 
 	headBytes := headOf(f.path)
 	var s *state
-	if old != nil && !packed(f.path) && f.size >= old.Size && old.Off <= f.size && sameHead(headBytes, old.Head, old.HeadSize) && old.ContentHash != "" && prefixHash(f.path, old.Size) == old.ContentHash {
+	if old != nil && !packed(f.path) && f.size >= old.Size && old.Off <= f.size && sameHead(headBytes, old.Head, int(old.HeadSize)) && old.ContentHash != "" && prefixHash(f.path, old.Size) == old.ContentHash {
 		s = old.clone()
 	} else {
 		s = &state{}
 	}
 	s.Size, s.Mod = f.size, f.mod.UnixNano()
-	s.Head, s.HeadSize = hashHead(headBytes), len(headBytes)
+	s.Head, s.HeadSize = hashHead(headBytes), int32(len(headBytes))
 	s.CdRead = parser.claude
 	s.ContentHash = prefixHash(f.path, f.size)
 	var head func([]byte) bool
@@ -2856,7 +2974,7 @@ func Titles(keys []string) map[string]string {
 			continue
 		}
 		if st := cache[path]; st != nil {
-			if name := cmp.Or(st.Named, st.Title, st.First); name != "" {
+			if name := cmp.Or(st.more().Named, st.Title, st.more().First); name != "" {
 				out[k] = name
 			}
 		}
