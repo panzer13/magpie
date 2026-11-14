@@ -28,6 +28,10 @@ const (
 	ToolResult Kind = "tool_result"
 	Thinking   Kind = "thinking"
 	Search     Kind = "web_search" // a web search run for the model: its query and hits
+	// Advice is Claude Code's advisor run by magpie for the model
+	// (advisor_serve.go): ID the call's, Text the advice, or Name an
+	// error_code and nothing in Text
+	Advice Kind = "advisor"
 )
 
 // Part is one block of a message.
@@ -240,6 +244,11 @@ type Request struct {
 	// such prompts, with the interactive mode on all the same
 	// (thirdPartyPrint)
 	tuiRefused bool
+	// unpasted, for the Claude bridge, is a request whose message Claude
+	// Code's interactive mode didn't take, or one with images on a
+	// machine where it didn't take an image (ok123now on X): its run is
+	// claude -p, with the interactive mode on all the same
+	unpasted bool
 	// hourMarks has the cache marks magpie adds on Anthropic's Messages
 	// (anthropicBody) last an hour: a Responses client's (Codex's), whose
 	// turns are often more than five minutes apart and whose own vendor
@@ -292,6 +301,19 @@ type Request struct {
 	ThinkOff  bool
 	Parallel  *bool // parallel tool calls allowed
 	WebSearch bool  // the client offered its provider's own web search
+	// GoogleTools are Gemini's own tools other than googleSearch (which
+	// is WebSearch) that the client offered, each one tool object as
+	// Google spells it — {"urlContext":{}}, {"codeExecution":{}},
+	// {"googleMaps":{}} — for an upstream that speaks Gemini, inside
+	// Code Assist's envelope too (buildCodeAssistSent). A Gemini client's
+	// tools, or the same objects in a Chat request's tools. Left out, a
+	// client's URL context and code execution were dropped on every
+	// translated route (daoche_wuzui on X). No other API runs them.
+	GoogleTools []json.RawMessage
+	// Advisor is the model of Claude Code's advisor that magpie runs
+	// itself (advisor_serve.go), "" when it doesn't: its calls and results
+	// in the conversation are ToolCall and ToolResult parts then
+	Advisor string
 	// WebAccess is the external_web_access of the client's web_search
 	// tool, as it sent it: Codex's web_search mode (false for "cached",
 	// true for "live"), which magpie's own search for a model that can't
@@ -451,6 +473,9 @@ const (
 	// keepaliveGap of nothing else: a reply read in rounds (searchReply)
 	// keeps its client alive with it as a translated stream does (#2316)
 	KAlive
+	// KAdvice: Claude Code's advisor run by magpie (advisor_serve.go), ID
+	// the call's, Text the advice, or Code its error_code
+	KAdvice
 )
 
 // Event is one thing a streaming reply said.
@@ -788,6 +813,9 @@ func (c *collector) add(ev Event) {
 	case KImage:
 		c.closeTool()
 		c.res.Parts = append(c.res.Parts, Part{Kind: Image, MediaType: ev.Name, Data: ev.Text})
+	case KAdvice:
+		c.closeTool()
+		c.res.Parts = append(c.res.Parts, Part{Kind: Advice, ID: ev.ID, Text: ev.Text, Name: ev.Code})
 	}
 	switch ev.Kind {
 	case KStart, KUsage, KError, KAlive:

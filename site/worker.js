@@ -33,6 +33,8 @@
 //   /download/windows      the Windows app (x64);  /download/windows-arm64
 //   /download/linux        the Linux app (x86-64); /download/linux-arm64
 //   /download/<file>       any file of the newest release, by name
+//   /download/stable, /download/stable/<platform or file>
+//                          the same from the Stable channel's release
 //   /files/<tag>/<file>    a release's file from R2 (files.js), the feed's
 //                          url and /download's for the files R2 holds;
 //                          GitHub's own address for any it doesn't
@@ -148,12 +150,16 @@ export default {
     if (dl) return detour(ctx, env, dl[1], dl[2]);
     if (url.pathname.startsWith(RELAY)) return relay(req, url);
     if (url.pathname === "/download" || url.pathname.startsWith("/download/")) {
-      const want = url.pathname.split("/")[2] || "mac-arm64";
-      const got = await latest(ctx, env);
+      // /download/stable/...: the same from the Stable channel's release
+      // (the home page's Stable choice, fishmagic80 on X)
+      const parts = url.pathname.split("/");
+      const onStable = parts[2] === "stable";
+      const want = parts[onStable ? 3 : 2] || "mac-arm64";
+      const got = onStable ? await stable(ctx, env, Date.now()).catch(() => null) : await latest(ctx, env);
       const rel = got && (await fromR2(ctx, env, got.rel));
       const asset = rel && rel.assets && rel.assets[SHORT[want] || want];
-      if (!asset) return new Response("not found\n", { status: 404 });
-      if (req.method === "GET") ctx.waitUntil(capture("magpie site download", { link: want, file: SHORT[want] || want, client: client(req), country: country(req) }));
+      if (!asset) return new Response(onStable && !got ? "the stable version isn't known yet\n" : "not found\n", { status: onStable && !got ? 503 : 404, headers: NO_STORE });
+      if (req.method === "GET") ctx.waitUntil(capture("magpie site download", { link: onStable ? "stable/" + want : want, file: SHORT[want] || want, client: client(req), country: country(req) }));
       return Response.redirect(asset.url, 302);
     }
     // crawlers and old browsers ask for /favicon.ico whatever the page links
@@ -519,7 +525,14 @@ async function keepFiles(ctx, env) {
     const to = a.api && (await located(a.api, env));
     return to ? fetch(to, { headers: UA }) : res;
   };
-  const done = await mirror(env, rels, open);
+  // the attestation bundles GitHub holds for a digest, in R2 beside the files
+  const attest = async (sha256) => {
+    const res = await api(`attestations/sha256:${sha256}`, env);
+    if (!res.ok) return null;
+    const j = await res.json();
+    return (j.attestations || []).map((x) => x.bundle).filter(Boolean);
+  };
+  const done = await mirror(env, rels, open, Date.now, attest);
   if (done.copied.length || done.failed.length) console.log("r2", JSON.stringify(done));
 }
 
@@ -547,11 +560,13 @@ async function fromAPI(env, path = "releases/latest") {
   const gh = await res.json();
   const tag = gh.tag_name;
   const listed = gh.assets.find((a) => a.name === "SHA256SUMS");
-  const got = await checksums(tag, env, listed && listed.url);
+  const listedSig = gh.assets.find((a) => a.name === SIG);
+  const got = await checksums(tag, env, listed && listed.url, listedSig && listedSig.url);
   if (!got) return null;
   const rel = { version: tag.replace(/^v/, ""), notes: gh.body || "", url: gh.html_url, published: gh.published_at, assets: {} };
+  if (got.signed) rel.signed = got.signed;
   for (const a of gh.assets) {
-    if (a.name === "SHA256SUMS") continue;
+    if (a.name === "SHA256SUMS" || a.name === SIG) continue;
     // api: the file's address in GitHub's API, which an app asks when
     // url is busy. With github.com's download address failing (504 for
     // hours on 2026-11-08), url is the site's /dl, which redirects
@@ -650,6 +665,7 @@ async function fromSums(tag, entry) {
   const sums = got.sums;
   const url = `https://github.com/${REPO}/releases/tag/${tag}`;
   const rel = { version: tag.replace(/^v/, ""), notes: entry ? entry.notes : "", url, published: entry ? entry.published : null, assets: {} };
+  if (got.signed) rel.signed = got.signed;
   for (const [name, sha256] of Object.entries(sums)) {
     rel.assets[name] = { url: `https://github.com/${REPO}/releases/download/${tag}/${name}`, size: 0, sha256 };
   }
@@ -1045,10 +1061,18 @@ function newer(a, b) {
   return x.pre > y.pre;
 }
 
+// SIG is the signature of SHA256SUMS, a release asset (see signed below).
+const SIG = "SHA256SUMS.sig";
+
 // checksums reads a release's SHA256SUMS: {sums: {file name: hash},
-// direct}, or null. direct says github.com's download address gave it;
-// when that fails, viaAPI (the file's address in GitHub's API) is asked.
-async function checksums(tag, env, viaAPI) {
+// direct, signed}, or null. direct says github.com's download address gave
+// it; when that fails, viaAPI (the file's address in GitHub's API) is asked.
+// signed is {sums, sig}: SHA256SUMS as published and its ed25519 signature
+// (base64, the release's SHA256SUMS.sig, viaAPISig in the API), or absent
+// for a release with none. The site only carries them; the app checks the
+// signature against the key it holds, so nothing here is trusted, this
+// worker included.
+async function checksums(tag, env, viaAPI, viaAPISig) {
   let r = null;
   try {
     r = await fetch(`https://github.com/${REPO}/releases/download/${tag}/SHA256SUMS`, { headers: UA });
@@ -1068,12 +1092,42 @@ async function checksums(tag, env, viaAPI) {
     }
     if (!r.ok) return null;
   }
+  const text = await r.text();
   const sums = {};
-  for (const line of (await r.text()).split("\n")) {
+  for (const line of text.split("\n")) {
     const [hash, name] = line.trim().split(/\s+\*?/);
     if (hash && name) sums[name] = hash;
   }
-  return { sums, direct };
+  const out = { sums, direct };
+  const sig = await signature(tag, env, direct, viaAPISig);
+  if (sig) out.signed = { sums: text, sig };
+  return out;
+}
+
+// signature is the release's SHA256SUMS.sig as the base64 line it holds, or
+// "" when the release has none (every release before it was signed).
+async function signature(tag, env, direct, viaAPI) {
+  let r = null;
+  if (direct) {
+    try {
+      r = await fetch(`https://github.com/${REPO}/releases/download/${tag}/${SIG}`, { headers: UA });
+    } catch (e) {
+      console.log(SIG, e);
+    }
+  }
+  if (!r || !r.ok) {
+    const to = viaAPI && (await located(viaAPI, env));
+    if (!to) return "";
+    try {
+      r = await fetch(to, { headers: UA });
+    } catch (e) {
+      console.log(SIG, "through the API", e);
+      return "";
+    }
+  }
+  if (!r.ok) return "";
+  const t = (await r.text()).trim();
+  return /^[A-Za-z0-9+/=]{80,100}$/.test(t) ? t : "";
 }
 
 // ---- icons ------------------------------------------------------------------

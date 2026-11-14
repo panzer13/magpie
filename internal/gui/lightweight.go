@@ -35,12 +35,12 @@ func (h *host) makeMain(url string) *application.WebviewWindow {
 	minW, minH := windowMin(z, 0, 0)
 	width, height := openSize(settings.Load().Window, minW, minH)
 	state := application.WindowStateNormal
-	if runtime.GOOS == "linux" && settings.Load().WindowMaximised {
+	if runtime.GOOS == "linux" && settings.Shared().WindowMaximised {
 		state = application.WindowStateMaximised
 	}
 	// Windows' title bar in the page's colour from the first frame; the
 	// page keeps it so as its theme changes (TintTitleBar)
-	winOpts, winBg := windowChrome(cmp.Or(os.Getenv("MAGPIE_THEME"), settings.Load().Theme))
+	winOpts, winBg := windowChrome(cmp.Or(os.Getenv("MAGPIE_THEME"), settings.Shared().Theme))
 	w := h.app.Window.NewWithOptions(application.WebviewWindowOptions{
 		Name:             "main",
 		Title:            "magpie",
@@ -58,6 +58,7 @@ func (h *host) makeMain(url string) *application.WebviewWindow {
 	})
 	h.zoomWhenLoaded(w)
 	lowWhileHidden(w)
+	h.mendWebView(w)
 	if runtime.GOOS == "windows" {
 		w.OnWindowEvent(events.Common.WindowRuntimeReady, func(*application.WindowEvent) { w.ExecJS(frameOnlyResizeJS) })
 	}
@@ -130,6 +131,7 @@ func (h *host) makePanel() *application.WebviewWindow {
 	w := h.app.Window.NewWithOptions(po)
 	h.zoomWhenLoaded(w)
 	lowWhileHidden(w)
+	h.mendWebView(w)
 	if h.tray != nil {
 		h.tray.AttachWindow(w).WindowOffset(6)
 	}
@@ -311,6 +313,9 @@ func (h *host) openMain(url string) {
 // can do that without showing it first (showsMinimised); elsewhere it is
 // shown quietly, as any window a restart by itself brings back.
 func (h *host) reveal(w *application.WebviewWindow, quiet, minimised bool) {
+	if runtime.GOOS == "darwin" {
+		plainTitlebar(w) // the Mac's, not shown yet; not at start (app.go)
+	}
 	if minimised && showsMinimised {
 		showMinimised(w, h.placeAt(w))
 		return
@@ -405,7 +410,7 @@ func (h *host) placeAt(w *application.WebviewWindow) (maximise bool) {
 		}
 		fitted = false
 	}
-	return settings.Load().WindowMaximised && !fitted
+	return settings.Shared().WindowMaximised && !fitted
 }
 
 // putBack moves the main window, not shown yet, to where it was last left

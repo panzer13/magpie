@@ -229,6 +229,7 @@ var cliForRoute = map[string]string{
 	"GET /api/update":                      "magpie update check",
 	"POST /api/update/check":               "magpie update check",
 	"POST /api/settings/agent-compact":     "magpie model compact",
+	"POST /api/settings/agent-contexts":    "magpie model window",
 	"POST /api/settings/agent-suffix":      "magpie model suffix",
 	"POST /api/settings/context-cap":       "magpie model context-cap",
 	"POST /api/settings/context-cap-mode":  "magpie model context-cap",
@@ -246,7 +247,11 @@ var notYet = map[string]string{
 	"GET /api/cli":                               A,  // api.go
 	"GET /api/drift":                             A,  // api.go
 	"GET /api/notices":                           W,  // api.go
+	"GET /api/feedback":                          W,  // feedback.go: Settings › About's Report a problem, which opens a page
 	"GET /api/omarchy":                           W,  // api.go
+	"GET /api/appearance/css":                    W,  // appearance.go: the stylesheet of the accent and the picture behind the pages; the accent is `magpie settings set accent`
+	"GET /api/appearance/wallpaper":              W,  // appearance.go
+	"POST /api/appearance/wallpaper":             W,  // appearance.go: the picture comes from the window's file picker
 	"GET /api/quit":                              W,  // api.go: the window's Quit question
 	"GET /api/remote":                            W,  // remote.go: another magpie opened in a window of the app
 	"POST /api/remote":                           W,  // remote.go
@@ -285,15 +290,18 @@ var notYet = map[string]string{
 	"POST /api/settings/codex-service-tier":      S2, // api.go
 	"POST /api/settings/codex-auto-reset":        S2, // api.go
 	"POST /api/settings/codex-auto-review":       S2, // api.go
+	"POST /api/settings/codex-client":            S2, // api.go
 	"POST /api/settings/codex-compact-held/drop": S2, // api.go
 	"POST /api/settings/codex-credits":           S2, // api.go
 	"POST /api/settings/codex-descriptions":      S2, // api.go
+	"POST /api/settings/codex-open":              S2, // api.go
 	"POST /api/settings/codex-predictions":       S2, // api.go
 	"POST /api/settings/codex-reset-lead":        S2, // api.go
 	"POST /api/settings/codex-titles":            S2, // api.go
 	"POST /api/settings/codex-warm-at":           S2, // api.go
 	"POST /api/settings/cors":                    S2, // api.go
 	"POST /api/settings/desktop-isolated":        A,  // api.go; `magpie claude-desktop launcher`, an agent's form this check can't read
+	"POST /api/settings/desktop-isolated-claude": A,  // api.go; `magpie claude-desktop launcher claude-dir`, an agent's form this check can't read
 	"POST /api/settings/desktop-longest":         S2, // api.go
 	"POST /api/settings/disabled-models":         S2, // api.go
 	"POST /api/settings/full-context":            S2, // api.go
@@ -374,6 +382,7 @@ var notYet = map[string]string{
 	"POST /api/masking/preview":                  U,  // masking.go
 	"POST /api/masking/values":                   U,  // masking.go
 	"GET /api/library/bili":                      L,  // library.go
+	"GET /api/library/bili/settings":             L,  // library.go
 	"GET /api/library/icon":                      W,  // library.go
 	"GET /api/library/market/servers":            L,  // library.go
 	"GET /api/library/market/skills":             L,  // library.go
@@ -384,6 +393,7 @@ var notYet = map[string]string{
 	"GET /api/library/skill":                     L,  // library.go
 	"POST /api/library/bili":                     L,  // library.go
 	"POST /api/library/bili/install":             L,  // library.go
+	"POST /api/library/bili/settings":            L,  // library.go
 	"POST /api/library/market/about":             L,  // library.go
 	"POST /api/library/mcp-account":              L,  // library.go
 	"POST /api/library/mcp-signin":               L,  // library.go
@@ -404,6 +414,7 @@ var notYet = map[string]string{
 	"POST /api/library/skills/check":             L,  // library.go
 	"POST /api/library/skills/probe":             L,  // library.go
 	"POST /api/library/plugins/probe":            L,  // library.go
+	"POST /api/library/subagents/probe":          L,  // library.go
 	"GET /api/memory":                            L,  // memory.go
 	"POST /api/memory":                           L,  // memory.go
 	"POST /api/memory/digest":                    L,  // memory.go
@@ -473,6 +484,10 @@ var notYet = map[string]string{
 	"POST /api/signin/export":                    P,  // providers.go
 	"POST /api/stepfun/{id}/session":             P,  // providers.go
 	"POST /api/stepfun/{id}/signout":             P,  // providers.go
+	"GET /api/qianwen/{id}/signin":               P,  // providers.go
+	"POST /api/qianwen/{id}/signin":              P,  // providers.go
+	"POST /api/qianwen/{id}/signin/cancel":       P,  // providers.go
+	"POST /api/qianwen/{id}/signout":             P,  // providers.go
 	"GET /api/speeds":                            U,  // sessions_manage.go: the Sessions row's speed curve
 	"GET /api/sessions/manage":                   U,  // sessions_manage.go
 	"GET /api/sessions/search":                   U,  // sessions_manage.go
@@ -504,6 +519,7 @@ var notYet = map[string]string{
 	"POST /api/tune/apply":                       U,  // tune.go
 	"POST /api/tune/undo":                        U,  // tune.go
 	"POST /api/uninstall/finish":                 A,  // uninstall.go
+	"GET /api/usage/checkins/off":                U,  // usage.go: the Usage page's switched-off check-ins; `magpie accounts checkin` does every account
 	"GET /api/usage/deleted/into":                U,  // usage.go
 	"GET /api/usage/heatmap":                     U,  // usage.go
 	"GET /api/usage/quotas/history/holds":        U,  // usage.go

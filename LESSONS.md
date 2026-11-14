@@ -172,7 +172,16 @@ content before you rest an account.**
   moved managedKey onto access.Named, with a test that fails on the old
   check. c83c0d5f (#1112) kept a pinned MAGPIE_ADDR host while sharing, and
   checked that requests behind Tailscale Serve still count as remote.
-- Seen 1× (2026-10-05).
+- 11-13: db9a5ec7c served Claude Code's advisor tool in magpie and asked
+  the advisor model as magpieChose, which drops the key's models list. The
+  caller names that model in the request, so a key held to some models
+  could reach any other model through it. v0.1.4023 and v0.1.4024 shipped
+  it; 0b38eb21c fixed it 23 minutes later, and found that the native
+  advisor had passed any same-provider Claude model upstream for a held key
+  since before. When a request can name a second model (advisor, a
+  sub-agent, a decision model), that model goes through keyAllows like the
+  first. 0b38eb21c ran `-run` gateway tests only, not the full suite.
+- Seen 2× (2026-10-05, 2026-11-13).
 
 **Scope a privacy or security exemption by where the value sits in the
 protocol, never by a key's name.**
@@ -325,6 +334,9 @@ every user.**
 - dccfefdf7 (#2635) made an imported skill follow the app's versioned
   folder. Skills imported before keep the stale link, and only the
   reporter was told to import again.
+- Done right on 11-13: 873a5caa2 (Edward4226, #2961) wrote new launch
+  agents as Standard, and 58ea9cade mended the Background ones already
+  installed the same day.
 - Seen 1× (2026-10-17).
 
 ## The user's own files and settings
@@ -356,6 +368,19 @@ could match the same key.**
 - Hold every clock the path reads, or write the fixture at time.Now(). Run
   it once with TZ=UTC and once in a far zone.
 - Seen 1× (2026-10-15).
+
+**A test never swaps time.Local: the code it tests takes its zone from a
+variable of its own.**
+- 4028687b8 (11-12) set time.Local to +08:00 in
+  TestMemorySearchDatesInLocalTime. Every time.Now reads time.Local, so
+  the swap raced an http conn goroutine an earlier test had left
+  finishing, and main's Test run at 727e23637 went red on macOS -race.
+  af212c945 gave memoryStamp a memoryZone variable and moved the
+  saved-zone check into memory, where the clock is already a variable.
+- #2949 (TestHeldClock) and #4360 (testenv.Zone's cleanup) are the same
+  race and still open. testenv.Zone waits for its own stand-ins only, not
+  for whatever another test left running.
+- Seen 1× (2026-11-12).
 
 **Work added to a path every request or poll takes is costed at that
 rate and at its largest input.**
@@ -495,6 +520,18 @@ push.**
   can't be spelled by a port, an id, a time or a hash.
 - Seen 2× (2026-10-10, 2026-11-10).
 
+**A script Settings loads runs in every mode the GUI has: the window,
+the panel and gateway mode.**
+- 22f2759d7 (11-11) added navpages.js, which read `$("#nav")` before
+  checking the mode. The panel has no #nav, so each Settings draw there
+  threw, and openAgentPrefs, which waits on that draw, opened no sheet
+  from the panel's menu. agent-prefs was red in both engines and all
+  five languages for two days. #6139 got two "seen again" comments and
+  a duplicate (#6311) before 41e330bdf fixed it.
+- Run the GUI files that open Settings in the panel too (`?mode=panel`),
+  and read the `pageerror` stack before calling a timeout load.
+- Seen 1× (2026-11-13).
+
 **Playwright's WebKit is not WebKitGTK.** A GUI change with motion or a new
 browser API is tried in the real Linux app too.
 - 18e82adc6 (10-11) traded the layouts in a view transition. The GUI suite
@@ -575,6 +612,20 @@ Two habits from them:
   TestProviderListReadsSettingsOnce's 2s bar, now a count of parses
   (a36319d60), and TestCursorEditorCopiedOncePerChange's 100ms linger
   (2efb71ea0).
+
+**A test that breaks a shared file puts its bytes back, and its cleanup
+checks the write.**
+- ea3dee96a (10-16) had TestFetchPrivateEntries write "{not json" to the
+  gateway package's shared settings.json and restore it with
+  `t.Cleanup(func() { settings.Save(was) })`. Save refuses to write over
+  a file it can't parse, and the cleanup dropped the error, so the
+  broken file waited for the next test that saved settings without
+  fresh(t). TestRemoteMagpieAskedToFollow went red on ubuntu CI at
+  836d074f1 (11-12), and the two tests run alone were red every time.
+  aa744b9ed writes back the bytes it read, and reports a failed write.
+- A cleanup that goes through the code under test inherits its guards.
+  Restore with the bytes read before, or give the test its own HOME.
+- Seen 1× (2026-11-13).
 
 **A value put in a request's context lives as long as anything that
 holds the context, a stopped timer included.**
@@ -729,6 +780,12 @@ cause:
 - A cancelled run tests nothing. On 10-14 nine pushes in ten minutes
   cancelled each other's runs, and 3c4b4dc97 never had a run of its own;
   its red showed first at 84f14e555.
+  - 11-13: 459d668b3 (#6428) edited docs/sync.html and did not run
+    `node llms-full.mjs`. site's "llms-full.txt is current" test went
+    red at 21:05. Every Test run after it was cancelled by the next
+    push until d5585933f's run finished at ~01:45 with the red. A docs
+    page change runs site/worker.test.mjs, because llms-full.txt is
+    built from those pages (fixed in 3d8860010).
   - 10-28: of main's last 58 Test runs, 49 were cancelled by the next
     push. 0b99b8fbe's new allocation bound went red in macOS's Race job
     (sync.Pool lets go under -race) at 25df3187b, the first run after it
@@ -786,7 +843,13 @@ before the merge, are in the code standards.)
   out to a plugin (#5918). A budget that counts comments makes them the
   cheapest thing to cut. Measure what the budget is about, and run the
   sub-second guard before pushing a change near it.
-- Seen 2× (2026-10-17, 2026-11-10).
+- 11-12: coreScriptBudget was raised four times in one afternoon, by
+  367 (d96403141), 151 (05cadcafd), 458 (4519eea71) and 113 (09e2eef0d),
+  1,089 bytes in all, each saying there was no page left to move it to.
+  09e2eef0d's 113 came from a rebase: 6055f626e fit at its base and the
+  two commits that landed under it filled the room.
+- Seen 3× (2026-10-17, 2026-11-10, 2026-11-12); moved to the code
+  standards.
 
 **A release published after a newer one takes Latest, and with it the
 update feed and the tap, unless the publish step checks.**
@@ -813,6 +876,12 @@ failure behind it.**
 **Keep the issue open until the reporter's case works. Reopen when they say
 it doesn't.**
 - On #876 the reporter couldn't reopen it themselves and had to file #888.
+- 11-13: #6482 (notarisation 403, "a required agreement is missing")
+  was closed at 08:22 UTC on one green release. The 403 kept coming
+  back between greens, and a notarytool timeout followed, so v0.1.4034,
+  4035, 4036, 4038 and 4042 were tagged and never published, with each
+  mirror-release left waiting. An intermittent fault is closed after a
+  run of releases, not one.
 - Don't close as not-planned what the owner hasn't ruled on. #769 and #871
   were reversed.
 - Done right on 10-07: #1050, #1053, #1063 and #958 shipped a fix and stayed
@@ -821,6 +890,53 @@ it doesn't.**
 
 **One commit, one goal** is in the code standards since 10-28. See
 [Moved to the code standards](#moved-to-the-code-standards).
+
+**A commit's file list is checked against its goal before pushing.**
+- 698ed4adb (11-12, "a busy port names its holder") was committed from a
+  tree made before two commits pushed eight minutes earlier, and took
+  both out with no word in its body: 919780414's Usage table view
+  (quotatable.js and its test deleted, its app.js, app.css and i18n
+  hunks reverted) and 88d2962e0's 16-byte sessions hashes (digest.go
+  deleted). Both were gone from main until c14fa0ce9 put them back.
+- The same day, three hours later: d31988c95 ("the Mac's plain title
+  bar is done as the main window is first shown") also reversed
+  1648fcfe2 and 95eab9a66, Mistral's prompt_cache_key: gateway.go's
+  withMistralCacheKey, mistral_cache_key_test.go and two
+  TestOwnCacheKey rows, none of them in its body. 2858566a1 put them
+  back. A GUI change has no reason to touch internal/gateway.
+- Before pushing, read `git show --stat HEAD` after the rebase. A deleted
+  file or a hunk in a package the goal never names means the tree is
+  stale: rebuild the change on origin/main, don't push the old tree.
+- Seen 1× (2026-11-12).
+
+**State added for one provider or one feature is keyed by it, not
+held process-wide.**
+- b70563ec6 kept one "accounts reordered at" stamp for the whole
+  gateway. Reordering Claude's accounts dropped every other provider's
+  conversation stick, so a Codex conversation lost its account and its
+  prompt cache on the next turn. In tests, any earlier reorder made
+  three cache tests red in package runs (#6249 and #6262, filed twice
+  for one cause). 04e38e604 keys the stamp by provider and has tests
+  forget it.
+- A test of such a value resets it in `t.Cleanup`, and a case where
+  another provider changes it shows the scope is right.
+- A process-local value set by the CLI never reaches the running
+  gateway (#6265).
+- Seen 1× (2026-11-12).
+
+**A commit saved early stays local until it is finished; "wip" never
+reaches main.**
+- f1e6705c5 (11-12 12:10), subject "wip" and no body, pushed the
+  turn-effort and thinking-summary code to main. Its test change came
+  35 minutes later in 9d47b441e, a one-line commit that carries the
+  whole record, and in between
+  TestClaudeSubscriptionPromptKeepsForeignHarnessOutOfSystem was red on
+  main (the CLI's --settings gained showThinkingSummaries). Its CI run
+  was cancelled, so nothing showed it.
+- Committing at once (the machine reboots) is right; pushing it isn't.
+  Before a push, `git log origin/main..HEAD --format=%s` names no
+  "wip", and the change and its tests go out as one commit.
+- Seen 1× (2026-11-12).
 
 **A squash merge's message is written, not GitHub's default.** Give
 `gh pr merge --squash` a `--subject` and a `--body-file` holding the PR's
@@ -834,6 +950,24 @@ own change and what was run at the reviewed head.
 - 10-14: b6e82c6c5 put a paragraph in the subject line. The subject is one
   short line; the rest goes in the body.
 - Seen 2× (2026-10-13, 2026-10-14).
+
+**A commit message file is made fresh for this commit, and its subject
+is read back before the push.**
+- plugins bc9f611e (11-12) went out as "qoder 0.2.60: the business record
+  names the model", another session's stale message file. Its content was
+  qoder 0.2.67, a different change; 7b42e404 had to note it after the
+  push, since main isn't rewritten.
+- 10-15: ce1251cc9, the Windows dsh fix, shipped under a lessons subject
+  for the same reason: zsh's noclobber made `cat >` onto the existing
+  file fail, and the commit took the old text.
+- Name the file for this change in your own scratch folder, write it with
+  `>|`, and check `git log -1 --format=%s` against the diff before
+  pushing.
+- Seen 2× (2026-10-15, 2026-11-12).
+
+**A commit's `--stat` names only the files its change touched** is in
+the code standards since 11-13. See
+[Moved to the code standards](#moved-to-the-code-standards).
 
 **A community PR that changes how a page looks is not merged on review
 alone.**
@@ -851,6 +985,16 @@ standards since 10-18, widened to a worktree and its logs. See
 
 ## Moved to the code standards
 
+- **A commit's `--stat` names only the files its change touched; any
+  other file is a stale tree** (11-11, 11-12, 11-13). On 11-13 8c7328f3a
+  (remote quotas) wrote 21 files back to 35aaaa4b9^ and took out three
+  commits; 926b1e7df put them back.
+  Again later on 11-13: 1f05c311d (memory tab) was a `git reset
+  --soft` of an older worktree onto fresh origin/main, and undid 45
+  files from 610ae1f54..c1312ac15 (49 in its --stat for a 4-file fix).
+  c2fd48782 restored them a minute later, byte for byte (`git diff
+  --stat c1312ac15 c2fd48782` is the fix's 4 files), before any tag.
+  Never `reset --soft` onto a newer base; rebase the commit instead.
 - **A red's issue is read to its last comment, and a patch on it is
   taken first** (10-12, 10-17, 10-27, 10-28). On 10-28 JoeyWu-tech's
   #3568 patch sat three days until CI went red on it again (11c427eaa).
@@ -870,6 +1014,9 @@ each one.
   answered psikent (/v1/models says every model takes tools) and windy
   (a group's Context hint names the member a longer conversation skips)
   under one subject that names only the first.
+- **A size budget is met, not raised** (10-17, 11-10, 11-12). On 11-12
+  coreScriptBudget rose four times in one afternoon (d96403141,
+  05cadcafd, 4519eea71, 09e2eef0d), 1,089 bytes, with nothing moved out.
 - **Never let magpie's default override a value the user set themselves**
   (10-05, 10-10, 10-17). On 10-17 5a2414acd brought every plugins.yml
   without `settled` up once, Essentials to All. A user who had run
@@ -1144,6 +1291,158 @@ each one.
     Their CI runs were cancelled by the next push, and ubuntu fails at
     apt (#6198), so no run showed it. A new package-level value runs
     `go test .` at the root too.
+- **11-12, criteria still missed.**
+  - The same root guard a fourth day running: 36eebea13 (the Update
+    pill) put `regexp.MustCompile` at package level in
+    internal/update/behind.go, and TestNoEagerPackageRegexps was red on
+    ubuntu and macOS CI at 67f61bd78 until 10e783080. Its body names no
+    run of `.`. The rule has been written here on 11-10 and 11-11 and is
+    still missed, so writing it again won't hold it: the guard should
+    run where every chosen-package run already goes (a vet check, or
+    the same test in each package that has package-level vars), not only
+    in the root package.
+  - A test swapped time.Local (4028687b8), and main went red under
+    -race; see "A test never swaps time.Local" above.
+  - The same guard again three hours later: 4519eea71 (Settings ›
+    About's Report a problem) put a package-level regexp in
+    internal/gui/feedback.go, and gave GET /api/feedback no command and
+    no notYet line, so TestNoEagerPackageRegexps and
+    TestEveryRouteHasACommandOrIsNamed were red at d0a4e0be6 until
+    f97415bc0. Its body lists the gui tests and vet it ran, and neither
+    guard's package. A new package-level var runs `go test .`; a new
+    route runs internal/cli's parity test.
+- **11-13, criteria still missed.**
+  - A budget's pass recorded at a tree it wasn't run at: 5a0e0378c's
+    body says TestCoreScriptBudget passed "rebased on 7583ed65c", but
+    the core had 40 bytes of room there and the commit added 344 to
+    plugins.js. Main was red on it from 06:00 (CI first at e9e63c6d7)
+    until 5a44051eb moved the hook into plugingrid.js. The budget is
+    pure arithmetic over the files: a copy of codeBytes over `git show`
+    gives the number for any sha in a second, so "passes" can be
+    checked at the pushed head without a build.
+  - ee1553913 wrote its "+1,112" budget reason twice in one comment for
+    one raise. A reason that is in the line twice reads as two raises.
+  - A patch on a red's issue taken first: yinwu01 posted 86e12bbd on
+    #5948 (TestGroupFailoverTimesEachTry, a fixed 80ms gap) on 11-10,
+    with every injected red written out. Nobody ported it for three
+    days, and it went red on macos CI at dbb2e5dd2 in a shape the issue
+    hadn't named (Millis == FirstText at :264). It was ported unchanged
+    as ff865b47a, the CI shape reproduced on mica with a 240ms hold.
+  - A size budget raised to fit: 2f34649a6 (Sign in on another
+    computer) was pushed 328 bytes over coreScriptBudget, so it and
+    4b3402035 are red at their own trees. dd9b2bcef then raised the
+    budget by exactly what was over, saying no page was left to move it
+    to, the reason 11-12's four raises gave. That is three raises today
+    (5a44051eb's +168 moved a hook out first; this one moved nothing).
+    The guard is sub-second over `git show` and is run before the push.
+    Two more raises followed before 13:00: c2a1d80fc +333 (its figure
+    moved into rotfig.js first) and b942a872b +236 ("no page left").
+    Five raises on 11-13, +2,145 bytes (ee1553913 +1,112 at 00:11); none moved code out
+    of the core beyond its own hook. #2710's growth rate is still unset.
+    Done right the same afternoon: d06d2383a moved the connect-address
+    save and the typed certificate into tlscerts.js and met the budget
+    with no raise, so "no page left" had a page.
+    The afternoon added three more: 6bc0d1e20 +180 and 5a2d0ff47 +81
+    (each moved its feature into a lazy file and kept the import), and
+    287a1ffa2 +225, putting back the Hermes profiles section that
+    1d60b165c had moved out of the core while the Agents rows still drew
+    it. a95a7a1cd +397 (per-key price rates) made nine raises on
+    11-13, +3,028 bytes. A move out of the core
+    first checks every caller of what it moves, or the budget comes back
+    with the code.
+    Again at 5b25d7e9e: +106 bytes into context.js with the core at
+    exactly its budget, tagged v0.1.4040 red; its record ran the
+    Routing GUI files and not the sub-second guard. e4ea31321
+    (v0.1.4043) met the budget with no raise, partly by joining
+    statements onto one line. Joining lines moves nothing out and costs
+    readability; it is a last resort, not the way to meet the budget.
+    The same evening 5211fd3ba (+1,016 lines) "packed" costInYuan to
+    land 3 bytes under it, after 9a8219237 had left 14. Each change now
+    shaves until it fits, and the next one has nothing to shave: move a
+    page out of the core first (#2710).
+    An hour later 23457a51f raised it 316 ("no page to move it to")
+    and left the media chip's Copy model ID out to fit: the budget now
+    shapes what users get. Done right: 817d35ffa then moved ~2.8KB of
+    usage helpers into page.js. The raises live in one ~3KB comment
+    line on coreScriptBudget; that is a log, not a growth rate.
+  - A record that points elsewhere: 2f34649a6's body is "Run: see push
+    notes", and 8f82e08b4's "(see below)" has nothing below it; neither
+    says whether what it ran passed. A pointer is not a record (10-14).
+  - The eager-regexp guard, red twice more: 1ca2c62c4 (catalog, fixed
+    in 19fd0dfb8) and d52e2feaf (agent, whose record is one -run in
+    ./internal/agent; fixed in 6a506e283). TestNoEagerPackageRegexps
+    lives in the root package, so a run of the changed package never
+    reaches it. A new package-level regexp is lazyre.New, and `go test
+    .` runs beside the package's own.
+    A third on 11-13: d21cb563e (davsync's setupBody) ran
+    ./internal/gui and ./internal/davsync, and 48e394146 (#6534) fixed
+    it. Six times in this file now, so a line here is not reaching the
+    sessions that add a regexp. A guard that only the root package runs
+    belongs in a check every push runs, or beside each package's tests.
+- **11-14, criteria still missed.**
+  - The sub-second guard left out again: 92e760f3d (per-key model tag)
+    ran its chosen GUI files, queued the full suite and pushed before
+    it finished. keysTag took the core 421 bytes over coreScriptBudget,
+    and main was red about an hour (#6518). The full suite found it
+    afterwards. TestCoreScriptBudget runs in a second over `git show`;
+    it is run before every push that touches the GUI's scripts, not
+    left to a suite that finishes after the push.
+  - Two sessions fixed #6518 at once. One had said on the issue that
+    it was taking it; f1f34d624 landed the same move without reading
+    the issue first, and the other's work was dropped. Read the
+    issue's last comment before starting on a red, as well as git log.
+  - A test that checks a duration to the millisecond:
+    TestLiveVisibleReasoningFixture set start to now minus at_ms, then
+    see read the clock again, so any pause between the two showed up in
+    the result. macOS CI read 6790 for 6789 (e730a14dc). d6cb40475 bounds it
+    by the time that really passed, red with a 3ms stall on the old
+    code. A test that sets a time from the clock and then reads the
+    clock again allows the time in between.
+  - A size budget raised to fit, again: c5b40bf89 raised
+    coreScriptBudget by 67 bytes for one connectLine line, "no page to
+    move it to", hours after f1f34d624 found room by moving keysTag
+    out. The owner hasn't set a growth rate (#2710), so a raise still
+    moves something out first.
+    dc85a7ca5 then added +12 for AIGoCode's logo in pngIcons, and
+    27c998aba +491 for costs in each provider's currency, nothing moved
+    out either: three raises by 13:00, +570 bytes.
+    11ddf076b (15:46) made it four, +326 for the Qwen platform sign-in,
+    though it put the field and its wait in qianwenplan.js first.
+    07a62b373 (16:34) a fifth, +72 for Copy all keys, the row itself in
+    keyrates.js. 80a315a70 (17:00) a sixth, +83 for the hidden page's
+    cache release: +1,051 bytes in a day, each raise "no page to move it
+    to".
+  - Chosen packages again: 11ddf076b (Qwen platform sign-in) ran
+    provider, gui and cli, not ./..., and its package-level regexp left
+    TestNoEagerPackageRegexps (root package) red on main from 15:46 to
+    16:55 (05d25d8dc). The same guard went red the same morning from the
+    yaml.v3 copy. A new file that adds a package-level value runs the
+    guards that walk the tree, which only ./... reaches.
+  - No Test run finished green from 63c91cae5 (11-13 21:51 UTC) to
+    07a62b373 (11-14 08:34 UTC): 57 runs were cancelled by the next push
+    and two went red (TestEffortUpdateRefused, fixed in a4937f8ff;
+    TestStaleLatestIsNotUpToDate, #6575). 81 commits and 51 releases
+    in that time had no CI run of their own, only the mote runs their
+    bodies name. A cancelled run tests nothing; when pushes come faster
+    than a run takes, someone lets one run finish, or the workflow keeps
+    the run of the newest tag instead of cancelling it.
+  - A library vendored for an allocation cut: 0caa09b3d copied
+    yaml.v3 v3.0.1 into third_party (11,400 lines, go.mod replace) for
+    a 7-line emitter change. The review diffed it against the gofmt'd
+    upstream: only those 7 lines differ. Footprint moved 59 -> 58 MB,
+    within run-to-run spread; the gain is ~24 MB of short-lived
+    allocations on a catalog change. The cost stays: an upstream fix
+    reaches magpie only when someone copies it over by hand
+    (MAGPIE.md says how), and the full suite wasn't run. A vendored
+    fork names its measured gain against that cost, and runs the suite.
+    The suite would have caught it: TestNoEagerPackageRegexps walks the
+    whole tree, and was red on main from 0caa09b3d until fc75d90af
+    patched yaml.v3 a second time. ea6470cb7 had left third_party out of
+    i18n-keys instead. Decide once which guards a vendored tree answers
+    to, and put that in its MAGPIE.md.
+  - Done right: f1f34d624 met the budget with no raise, moving keysTag
+    into keyrates.js, which is loaded exactly when a model can have a
+    key tag.
 - **Done right on 10-17.** The retire stack (0f1666b38 to de671719a)
   diffed staticcheck's U1000 against its base for dead code, b98f906b1
   was red on the old code for an own-account gap, and 8 subscriptions
