@@ -178,8 +178,8 @@ func readChat(body []byte, facts bool) (*Request, error) {
 				r.Messages = append(r.Messages, Message{Role: "user", Parts: []Part{{Kind: ToolResult, CallID: m.ToolCallID}}})
 				continue
 			}
-			out, images := toolOutput(m.Content)
-			r.Messages = append(r.Messages, Message{Role: "user", Parts: []Part{{Kind: ToolResult, CallID: m.ToolCallID, Text: out, Images: images}}})
+			out, images, audio := toolOutput(m.Content)
+			r.Messages = append(r.Messages, Message{Role: "user", Parts: []Part{{Kind: ToolResult, CallID: m.ToolCallID, Text: out, Images: images, Audio: audio}}})
 		}
 	}
 	r.System = strings.Join(sys, "\n\n")
@@ -247,6 +247,10 @@ func chatParts(raw json.RawMessage) []Part {
 		VideoURL struct {
 			URL string `json:"url"`
 		} `json:"video_url"`
+		InputAudio struct {
+			Data   string `json:"data"`
+			Format string `json:"format"`
+		} `json:"input_audio"`
 		// the AI SDK's file part, flat (#4101: ZCode's), whose video
 		// alone is read here
 		Data      string `json:"data"`
@@ -278,9 +282,32 @@ func chatParts(raw json.RawMessage) []Part {
 			if v, ok := videoPart(it.VideoURL.URL, "", ""); ok {
 				out = append(out, v)
 			}
+		case "input_audio":
+			// a recording, as OpenAI's Chat takes one ({data, format}):
+			// left out before, so Gemini answered for the words alone
+			// (Parlevent_ on X); a Gemini upstream is given it inline
+			if it.InputAudio.Data != "" {
+				out = append(out, Part{Kind: File, MediaType: audioType(it.InputAudio.Format), Data: it.InputAudio.Data})
+			}
 		}
 	}
 	return out
+}
+
+// audioType is the media type of a Chat input_audio's format: wav and mp3
+// are OpenAI's, a type given whole is kept, and the others are taken as
+// audio/<format>, as Gemini names them (audio/aac, audio/flac, audio/ogg).
+func audioType(format string) string {
+	f := strings.ToLower(strings.TrimSpace(format))
+	switch {
+	case f == "":
+		return "audio/wav"
+	case strings.Contains(f, "/"):
+		return f
+	case f == "mpeg":
+		return "audio/mp3"
+	}
+	return "audio/" + f
 }
 
 // chatFile is a Chat Completions file part (a PDF, say) as a file of the
@@ -478,14 +505,13 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 					names[id] = p.Name
 					call := map[string]any{"id": id, "type": "function",
 						"function": map[string]any{"name": p.Name, "arguments": argsString(p)}}
-					if gemini {
-						// a later call of a signed step goes without: Gemini
-						// signs the first
-						if sig := p.Signature; sig != "" {
-							call["extra_content"] = googleExtra(sig)
-						} else if !signed {
-							call["extra_content"] = googleExtra(skipSignature)
-						}
+					if sig := p.Signature; sig != "" && (gemini || r.signer != "" && signerOf(sig) == r.signer) {
+						// Gemini's, or a relay's that gave it there
+						call["extra_content"] = googleExtra(sig)
+					} else if gemini && !signed {
+						// a later call of a signed step goes without:
+						// Gemini signs the first
+						call["extra_content"] = googleExtra(skipSignature)
 					}
 					calls = append(calls, call)
 				case Thinking:
@@ -563,6 +589,9 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 					content = append(content, chatVideo(p))
 					break
 				}
+				// told of, not carried: Chat upstreams' file support is
+				// uneven, and a 400 here loses the whole turn (#934) — the
+				// Responses and Messages tongues carry it whole (#5452)
 				content = append(content, map[string]any{"type": "text", "text": attachmentText(p)})
 			case Image:
 				plain = false
@@ -707,13 +736,20 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 //     reasoning — is dropped inside a pending exchange, where it would
 //     sit between calls and their answers. One with neither text nor
 //     calls was taken out before, wherever it stood
-//     (withoutSilentAssistants, #2599).
+//     (withoutSilentAssistants, #2599);
+//   - a system or developer message between the calls and their tool
+//     messages goes after them: DeepSeek takes it for the message after
+//     the calls and refuses the request ("tool_use ids were found
+//     without tool_result blocks immediately after"), and read as the
+//     turn after them it gave the calls synthetic results and the real
+//     ones went as user text.
 func pairToolMessages(msgs []map[string]any) []map[string]any {
 	out := make([]map[string]any, 0, len(msgs))
 	var pending []string          // calls of the last assistant message with tool_calls
 	order := map[string]int{}     // a pending call's place among them
 	answered := map[string]bool{} // pending calls a tool message answered
 	var tools []map[string]any    // answers to pending, held for sorting
+	var held []map[string]any     // system messages after pending's calls
 
 	flushTools := func() {
 		if len(tools) == 0 {
@@ -734,6 +770,8 @@ func pairToolMessages(msgs []map[string]any) []map[string]any {
 			}
 		}
 		pending, order, answered = nil, map[string]int{}, map[string]bool{}
+		out = append(out, held...)
+		held = nil
 	}
 	// toolAsUser turns a tool message that answers no pending call into a
 	// user message carrying its result. A user message just emitted takes
@@ -789,6 +827,15 @@ func pairToolMessages(msgs []map[string]any) []map[string]any {
 			}
 			answered[id] = true
 			tools = append(tools, m)
+		case "system", "developer":
+			if len(pending) > 0 {
+				// between the calls and their tool messages, which must
+				// follow them at once (DeepSeek, Kimi): it goes after
+				// them, and the results it stood before stay results
+				held = append(held, m)
+				continue
+			}
+			out = append(out, m)
 		default:
 			flushPending()
 			out = append(out, m)

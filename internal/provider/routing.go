@@ -221,6 +221,12 @@ func SetRestartApp(id string, on bool) error {
 	return Save(*p)
 }
 
+// CodexRestartsApp is codexRestartsApp, for the agent package: a change
+// of Codex's route magpie makes by itself restarts the Codex app's
+// app-server (moving the chats it has open first, CodexBeforeAppEnd) only
+// when it says so.
+func CodexRestartsApp() bool { return codexRestartsApp() }
+
 // codexRestartsApp is whether the user had magpie restart the Codex app's
 // app-server for a change it makes by itself (Provider.RestartApp). While
 // providers.json can't be read it is unknown, and the app is left be: a
@@ -962,7 +968,7 @@ func readAllowances(agent string) map[string]Allowance {
 				}
 				c.read[key] = st
 			}
-			var renewed, restarts []string
+			var renewed, restarts, credits []string
 			for user, a := range all {
 				key := agent + "/" + strings.ToLower(user)
 				if c.renewed[key] > began {
@@ -978,6 +984,11 @@ func readAllowances(agent string) map[string]Allowance {
 					}
 					if a.startedAgain(was.a, was.at, share, now) {
 						restarts = append(restarts, user)
+					}
+					if a.OnCredits() && !was.a.OnCredits() {
+						// credits it was not read to hold: bought once
+						// its allowance ran out (NoteCodexCredits)
+						credits = append(credits, user)
 					}
 				}
 				c.seen[key] = reading{a, now}
@@ -1012,6 +1023,11 @@ func readAllowances(agent string) map[string]Allowance {
 			}
 			for _, user := range restarts {
 				tellStarted(agent, user)
+			}
+			for _, user := range credits {
+				if agent != "codex" || CodexCredits(user) {
+					tellCredits(agent, user)
+				}
 			}
 			close(done)
 		})

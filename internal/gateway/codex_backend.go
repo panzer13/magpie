@@ -158,6 +158,12 @@ func (s *Server) codexBackend(w http.ResponseWriter, r *http.Request) {
 				s.codexPrediction(w, r, body, to)
 				return
 			}
+			// the app's prompt suggestions on the model set for them
+			// (codexSuggestionsTo), the model asked kept for the trace
+			if to := codexSuggestionsTo(r, agentOf(r), kind, model); to != "" {
+				r = withSuggestionsAsked(r, model)
+				body, model = withModel(body, to), to
+			}
 			// a subagent on one of Codex's own models, put on the model
 			// set for Codex's subagents, a ChatGPT account's in magpie;
 			// the request on the model asked for when it can't be, the
@@ -1128,6 +1134,7 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 		window := cmp.Or(provider.CodexWindow(user, model), catalog.ContextOf(model))
 		tr = s.trace.beginFor(r, Route{turn: turn, window: window, dirOf: dirOf(provider.Responses, body), tools: tools, imageTurn: drawingTurnID(metadata.Turn), imageCaller: codexTurnKey(r, callerOf(r).agent), imageProvider: imageProvider, TitleLink: link, Time: start, Agent: callerOf(r).agent, Session: sessionOf(r.Header), Conv: convOf(r.Header, body), ParentSession: titleParentSession(r.Header, metadata, kind), Kind: kind, Model: model, Effort: effort, Tier: tier, Provider: "openai", Subagent: subagentPickOf(r),
 			Order: []Weighed{seat}, Tries: []Try{{ID: seat.ID, Model: model, Effort: effort, Tier: tier, Start: start}}})
+		noteChecked(r, sentWhole, maskedHits)
 		if m := noteMasked(r, "chat", maskedHits, sentOf(maskedHits, body), tr.ID, "openai", model); m != nil {
 			s.trace.update(tr, func(t *Route) { t.Masked = m })
 		}
@@ -1161,6 +1168,7 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 					return max(ms-before, 1)
 				}
 				try.TTFT, try.FirstText = fromTry(ttft), fromTry(text)
+				try.FirstReasoning = fromTry(first.reasoningMs())
 				try.Net = nt.timing(try.Start, 0)
 				t.ReasoningHidden = first.hidesReasoning(provider.Responses, uu.Reasoning)
 				try.ReasoningHidden = t.ReasoningHidden
@@ -1171,6 +1179,7 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 					t.TitleLink = &link
 				}
 				t.Output, t.Reasoning, t.TTFT, t.FirstText = out, uu.Reasoning, ttft, text
+				t.FirstReasoning = first.reasoningMs()
 				flow := first.flowFor(uu.Reasoning)
 				t.Flow, try.Flow = flow, flow
 				t.Usage = routeUsage("openai", model, uu)
@@ -1341,6 +1350,13 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 				// row, to sign in again (#1793)
 				noteSignIn(ctx, on.Account, req, res)
 			}
+			if rest == "/responses" && res.StatusCode == http.StatusTooManyRequests {
+				if acct, ok := codexRelayedAccount(base, r.Header, on); ok {
+					// what the refusal says of the account's credits, for
+					// asking again on them below (heardCodexCredits)
+					heardCodexCredits(acct, res.Header)
+				}
+			}
 			if !creditsAsked && rest == "/responses" && base != codexAPIBase && res.StatusCode == http.StatusTooManyRequests && relayOnCredits(on) {
 				// the account holds credits and was refused as out of its
 				// allowance: ChatGPT may turn away the turn that uses the
@@ -1466,7 +1482,7 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 			res.Body = io.NopCloser(bytes.NewReader(msg))
 			// its credits and resets looked at above, a 429 that names
 			// when the account is back holds it till then (codexHolds)
-			noteCodexHold(holdKey, res.StatusCode, res.Header, msg)
+			noteCodexHold(holdKey, res.StatusCode, res.Header, msg, relayOnCredits(on))
 			if overload && codexBusy(res.StatusCode, msg) && s.codexFallsBack(r, body) {
 				// still too busy once asked again: the fallbacks answer
 				said := provider.APIError(msg, res.Status)
@@ -1620,6 +1636,7 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 		call.Fallback = strings.TrimSuffix(call.Fallback, "; ")
 	}
 	call.TTFT, call.FirstText = first.ms()
+	call.FirstReasoning = first.reasoningMs()
 	uu.add(sniff.usage())
 	call.ReasoningHidden = first.hidesReasoning(provider.Responses, uu.Reasoning)
 	uu.Tier = servedTierAt(provider.HostOf(base), uu.Tier)
@@ -1672,7 +1689,7 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 		Input: uu.Input, Output: uu.Output, CacheRead: uu.CacheRead, CacheWrite: uu.CacheWrite,
 		Reasoning: uu.Reasoning, Effort: effort, Millis: call.Millis, Masking: maskingMs(r.Context(), 0),
 		// Codex's own sign-in: the request goes as Codex sent it
-		TierAsked: bodyTier(provider.Responses, body), TierSent: bodyTier(provider.Responses, body), TierServed: uu.Tier, TTFT: call.TTFT, FirstText: call.FirstText, ReasoningHidden: call.ReasoningHidden, Flow: call.Flow, Status: call.Status, Session: sessionOf(r.Header), NativeSession: nativeSessionOf(r.Header), Kind: call.Kind,
+		TierAsked: bodyTier(provider.Responses, body), TierSent: bodyTier(provider.Responses, body), TierServed: uu.Tier, TTFT: call.TTFT, FirstText: call.FirstText, FirstReasoning: call.FirstReasoning, ReasoningHidden: call.ReasoningHidden, Flow: call.Flow, Status: call.Status, Session: sessionOf(r.Header), NativeSession: nativeSessionOf(r.Header), Kind: call.Kind,
 		RequestID: requestID(res.Header), ResponseID: uu.ResponseID, Endpoint: r.URL.Path}
 	failedWith(&rec, call.Status, call.Error, errType)
 	if up := upBytesOf(r.Context()); up != nil {
@@ -1943,6 +1960,9 @@ func withoutUnreadable(body, msg []byte) ([]byte, bool) {
 }
 
 // withoutItem is a Responses request without the input item of this id.
+// A compaction of magpie's own (cmp_magpie_…, hey_boyce on X: one that
+// reached OpenAI as it was written) goes as the summary it holds, so
+// the turn keeps what came before.
 func withoutItem(body []byte, id string) ([]byte, bool) {
 	var q map[string]json.RawMessage
 	if json.Unmarshal(body, &q) != nil {
@@ -1952,17 +1972,27 @@ func withoutItem(body []byte, id string) ([]byte, bool) {
 	if json.Unmarshal(q["input"], &items) != nil {
 		return nil, false
 	}
-	kept := items[:0:0]
+	kept, found := items[:0:0], false
 	for _, it := range items {
 		var t struct {
-			ID string `json:"id"`
+			ID        string `json:"id"`
+			Type      string `json:"type"`
+			Encrypted string `json:"encrypted_content"`
 		}
 		if json.Unmarshal(it, &t) == nil && t.ID == id {
+			found = true
+			if t.Type == "compaction" {
+				if msg, ours := codexsummary.Message(t.Encrypted); ours && msg != nil {
+					if b, err := json.Marshal(msg); err == nil {
+						kept = append(kept, b)
+					}
+				}
+			}
 			continue
 		}
 		kept = append(kept, it)
 	}
-	if len(kept) == len(items) {
+	if !found {
 		return nil, false
 	}
 	q["input"], _ = json.Marshal(kept)
@@ -2389,10 +2419,52 @@ func (s *Server) askCodexList(rctx context.Context, h http.Header, query string,
 	}
 }
 
+// codexListAuth keeps the client's ChatGPT sign-in apart from the gateway
+// key identifyCaller replaces with its internal token (#5197).
+type codexListAuth struct{}
+
+func keepCodexListAuth(r *http.Request, identified bool) *http.Request {
+	if r.Method != http.MethodGet || r.URL.Path != CodexPath+"/models" {
+		return r
+	}
+	auth := ""
+	if identified {
+		auth = r.Header.Get("Authorization")
+	}
+	a := strings.TrimSpace(auth)
+	if len(a) <= 7 || !strings.EqualFold(a[:7], "Bearer ") {
+		auth = ""
+	} else {
+		token := strings.TrimSpace(a[7:])
+		if token == "" || token == Token || strings.HasPrefix(token, Token+"-") || access.Named(token) || access.Default(token) {
+			auth = ""
+		}
+	}
+	return r.WithContext(context.WithValue(r.Context(), codexListAuth{}, auth))
+}
+
 // codexModels is the ChatGPT backend's model list for this sign-in, with
 // magpie's models after it. Should the backend not answer, or not in
 // time, Codex's last list of its own stands in.
 func (s *Server) codexModels(w http.ResponseWriter, r *http.Request) {
+	if auth, kept := r.Context().Value(codexListAuth{}).(string); kept {
+		if auth == "" {
+			writeError(w, provider.Responses, http.StatusUnauthorized, "a ChatGPT sign-in is required for the Codex backend model list")
+			return
+		}
+		// Both the cache key and the backend ask use the client's sign-in,
+		// after the gateway's guards have judged its key. No gateway key
+		// or internal token belongs in the request to ChatGPT.
+		r = r.Clone(r.Context())
+		r.Header.Set("Authorization", auth)
+		for _, h := range []string{"x-api-key", "x-goog-api-key", "x-openai-actor-authorization"} {
+			r.Header.Del(h)
+		}
+		if q := r.URL.Query(); q.Has("key") {
+			q.Del("key")
+			r.URL.RawQuery = q.Encode()
+		}
+	}
 	var own []any
 	body, etag, deny, denyBody := s.codexBackendList(r)
 	// A sign-in the backend calls revoked (401 token_revoked, "Encountered
@@ -4059,13 +4131,14 @@ func summaryEndedShort(rec *recorder) bool {
 // upstreamFailed is a relay's own word that the provider behind it turned
 // the request away, without saying why: "flyapi: Upstream request failed"
 // came as a 404 (#866), "apex: Upstream request failed" as a 400
-// invalid_request_error (#1511). Codex asking the same relay itself
-// compacts, so the summary request is asked again as text, and compacted
-// without a model when that fails too.
+// invalid_request_error (#1511), Open Design's "[code=upstream_error]
+// Provider returned error" as a 400 (vendorUnsaidWords). Codex asking the
+// same relay itself compacts, so the summary request is asked again as
+// text, and compacted without a model when that fails too.
 func upstreamFailed(rec *recorder) bool {
 	return rec.status >= 400 && rec.status < 500 && rec.status != http.StatusUnauthorized &&
 		rec.status != http.StatusForbidden && rec.status != http.StatusTooManyRequests &&
-		upstreamFailedWords.Match(rec.body.Bytes())
+		(upstreamFailedWords.Match(rec.body.Bytes()) || vendorUnsaidWords.Match(rec.body.Bytes()))
 }
 
 var upstreamFailedWords = lazyre.New(`(?i)upstream request failed`)
@@ -4083,7 +4156,7 @@ func roleRefused(rec *recorder, err error) bool {
 	if rec.status >= 400 {
 		return upstreamFailed(rec) || rec.status == http.StatusBadRequest && systemRefusedWords.Match(rec.body.Bytes())
 	}
-	return err != nil && (systemRefusedWords.MatchString(err.Error()) || upstreamFailedWords.MatchString(err.Error()))
+	return err != nil && (systemRefusedWords.MatchString(err.Error()) || upstreamFailedWords.MatchString(err.Error()) || vendorUnsaidWords.MatchString(err.Error()))
 }
 
 var systemRefusedWords = lazyre.New(`(?i)system messages are not allowed`)
@@ -4116,7 +4189,9 @@ func itemNotFound(rec *recorder) bool {
 // outputs and reasoning, and answers anything else 400
 // "unsupported_input_item" with param "input" (#5181, Edward4226; #5259,
 // Mmx233, a Codex subagent's history), and Grok's backend an
-// agent_message 422 "unknown item type". It comes as that status, as
+// agent_message 422 "unknown item type", and a local Qwen server's
+// Responses API 400 "Unsupported input item: agent_message" (cyberestro
+// on X). It comes as that status, as
 // another magpie's message in front of it ("Remote magpie: Command Code:
 // {…}", a 400 or its 502), or as an error event in the summary's stream.
 // The conversation as text is messages alone, which it takes. A refusal
@@ -4132,7 +4207,7 @@ func inputKindRefused(rec *recorder, err error) bool {
 	return inputKindWords.Match(rec.body.Bytes())
 }
 
-var inputKindWords = lazyre.New(`(?i)unsupported_input_item|unknown item type`)
+var inputKindWords = lazyre.New(`(?i)unsupported[ _]input[ _]item|unknown item type`)
 
 // compactFailure names who answered a summary request with a failure — the
 // provider, the model and the provider's base URL — and what it said.

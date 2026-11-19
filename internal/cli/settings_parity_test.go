@@ -197,6 +197,7 @@ var cliForRoute = map[string]string{
 	"POST /api/davsync/{action}":           "magpie webdav",
 	"GET /api/caller-keys":                 "magpie gateway-key list",
 	"POST /api/caller-keys/{action}":       "magpie gateway-key",
+	"GET /api/caller-keys/account-windows": "magpie quota", // the windows `gateway-key limit <id> account` takes
 	"GET /api/account-groups":              "magpie gateway-key groups",
 	"POST /api/account-groups/{action}":    "magpie gateway-key groups",
 	"GET /api/groups":                      "magpie groups",
@@ -217,9 +218,12 @@ var cliForRoute = map[string]string{
 	"GET /api/login/usage":                 "magpie quota",
 	"GET /api/providers":                   "magpie providers",
 	"POST /api/provider/{action}":          "magpie provider",
+	"POST /api/providers/delete":           "magpie provider rm",
 	"GET /api/sessions/reads":              "magpie sessions read",
 	"POST /api/sessions/reads":             "magpie sessions read",
 	"GET /api/sessions":                    "magpie sessions",
+	"GET /api/sessions/said":               "magpie sessions search",
+	"GET /api/sessions/transcript":         "magpie sessions show",
 	"POST /api/uninstall":                  "magpie uninstall",
 	"GET /api/usage":                       "magpie usage",
 	"GET /api/usage/quotas":                "magpie quota",
@@ -253,6 +257,9 @@ var notYet = map[string]string{
 	"GET /api/appearance/wallpaper":              W,  // appearance.go
 	"POST /api/appearance/wallpaper":             W,  // appearance.go: the picture comes from the window's file picker
 	"GET /api/quit":                              W,  // api.go: the window's Quit question
+	"POST /api/quit/disconnect":                  W,  // api.go: the Quit question's Disconnect and quit, which quits the app
+	"POST /api/restart":                          W,  // restart.go: the app starting itself again, as the tray's Restart magpie does
+	"POST /api/page-away":                        W,  // api.go: the page says it went from view, so its caches can go
 	"GET /api/remote":                            W,  // remote.go: another magpie opened in a window of the app
 	"POST /api/remote":                           W,  // remote.go
 	"POST /api/remote/forget":                    W,  // remote.go
@@ -272,6 +279,7 @@ var notYet = map[string]string{
 	"POST /api/profile/{action}":                 A,  // api.go
 	"POST /api/proxy/check":                      S2, // api.go
 	"POST /api/pipelines/check":                  S2, // pipecheck.go: Settings › Models' Quick check, one real call a pipeline
+	"POST /api/relay-check":                      S2, // pipecheck.go: the Usage speed card by provider, its check button: a few small real calls to one model on one provider
 	"POST /api/proxies/save":                     S2, // proxies.go: Settings › Network's saved proxies
 	"POST /api/proxies/delete":                   S2, // proxies.go
 	"POST /api/proxies/test":                     S2, // proxies.go
@@ -297,6 +305,7 @@ var notYet = map[string]string{
 	"POST /api/settings/codex-open":              S2, // api.go
 	"POST /api/settings/codex-predictions":       S2, // api.go
 	"POST /api/settings/codex-reset-lead":        S2, // api.go
+	"POST /api/settings/codex-suggestions":       S2, // api.go
 	"POST /api/settings/codex-titles":            S2, // api.go
 	"POST /api/settings/codex-warm-at":           S2, // api.go
 	"POST /api/settings/cors":                    S2, // api.go
@@ -334,6 +343,7 @@ var notYet = map[string]string{
 	"POST /api/settings/update-skip":             S2, // api.go
 	"POST /api/settings/workbuddy-checkin":       S2, // api.go
 	"POST /api/usage/arrange":                    W,  // api.go
+	"POST /api/warm-all":                         A,  // api.go: All accounts warms every account in use (5bd41301b)
 	"POST /api/warm-now":                         A,  // api.go
 	"POST /api/window/{action}":                  W,  // api.go
 	"GET /api/autobackup":                        S2, // backup.go: Back up by itself
@@ -415,6 +425,7 @@ var notYet = map[string]string{
 	"POST /api/library/skills/probe":             L,  // library.go
 	"POST /api/library/plugins/probe":            L,  // library.go
 	"POST /api/library/subagents/probe":          L,  // library.go
+	"POST /api/library/commands/probe":           L,  // library.go
 	"GET /api/memory":                            L,  // memory.go
 	"POST /api/memory":                           L,  // memory.go
 	"POST /api/memory/digest":                    L,  // memory.go
@@ -488,6 +499,8 @@ var notYet = map[string]string{
 	"POST /api/qianwen/{id}/signin":              P,  // providers.go
 	"POST /api/qianwen/{id}/signin/cancel":       P,  // providers.go
 	"POST /api/qianwen/{id}/signout":             P,  // providers.go
+	"POST /api/qianfan/{id}/session":             P,  // providers.go
+	"POST /api/qianfan/{id}/signout":             P,  // providers.go
 	"GET /api/speeds":                            U,  // sessions_manage.go: the Sessions row's speed curve
 	"GET /api/sessions/manage":                   U,  // sessions_manage.go
 	"GET /api/sessions/search":                   U,  // sessions_manage.go
@@ -502,7 +515,6 @@ var notYet = map[string]string{
 	"GET /api/sessions/overview":                 U,  // sessions.go
 	"GET /api/sessions/progress":                 U,  // sessions.go
 	"GET /api/sessions/stats":                    U,  // sessions.go
-	"GET /api/sessions/transcript":               U,  // sessions.go
 	"POST /api/agents/open":                      W,  // sessions.go
 	"POST /api/sessions/carry":                   U,  // sessions.go
 	"POST /api/sessions/export":                  U,  // sessions.go
@@ -517,6 +529,7 @@ var notYet = map[string]string{
 	"POST /api/gateway/unrest":                   U,  // trace.go
 	"GET /api/tune":                              U,  // tune.go
 	"POST /api/tune/apply":                       U,  // tune.go
+	"POST /api/tune/takeover":                    U,  // tune.go
 	"POST /api/tune/undo":                        U,  // tune.go
 	"POST /api/uninstall/finish":                 A,  // uninstall.go
 	"GET /api/usage/checkins/off":                U,  // usage.go: the Usage page's switched-off check-ins; `magpie accounts checkin` does every account

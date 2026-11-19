@@ -220,10 +220,11 @@ func (p Provider) ModelTest() string {
 // (Vercel's TypeSafe API, OpenRouter's), or Workers AI's, which DecideAsk
 // wraps it for (ARNO on Discord: cloudflare-jev's models couldn't be
 // tested from their right-click); not Vercel's evaluation models, which
-// name the model in headers of their own.
+// name the model in headers of their own. Google's Decisions API, which
+// DecideAsk asks as it takes it, can be too.
 func (p Provider) AsksDecideModels() bool {
 	v := p.DecideVia()
-	return p.Decides() && (v == ViaSystemOne || v == ViaVercel || v == ViaCloudflare)
+	return p.Decides() && (v == ViaSystemOne || v == ViaVercel || v == ViaCloudflare || v == ViaGoogle)
 }
 
 // mantleBase is base for model at the prefix Mantle serves it under
@@ -1167,6 +1168,9 @@ func APIError(b []byte, fallback string) string {
 	if cmdGoNoAPI.Match(b) {
 		return apiError(b, fallback) + " — " + CommandCodeGoHint
 	}
+	if harnessOnly.Match(b) && !bytes.Contains(b, []byte(HarnessOnlyHint)) {
+		return apiError(b, fallback) + " — " + HarnessOnlyHint
+	}
 	return apiError(b, fallback)
 }
 
@@ -1372,7 +1376,7 @@ func apiError(b []byte, fallback string) string {
 	// a body in no shape known is shown as it is, cut short, so what the
 	// vendor said isn't lost; other markup (an XML error, a page's
 	// fragment) by its words, its tags taken out
-	s := strings.Join(strings.Fields(string(b)), " ")
+	s := strings.Join(strings.Fields(QuotedReply(b)), " ")
 	if strings.HasPrefix(s, "<") {
 		if s = MarkupText(b); s == "" {
 			return fallback

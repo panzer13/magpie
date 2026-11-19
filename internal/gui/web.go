@@ -1,6 +1,7 @@
 package gui
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
@@ -134,7 +135,7 @@ func StartWeb(addr, version string) (*Web, error) {
 	go w.srv.Serve(ln)
 	// Settings' AutoRestart: magpie web runs on as the new version (#2096)
 	updates.autoRestart = func() bool {
-		if restartInto(true, false, "", true, false) {
+		if restartInto(true, false, "", true) {
 			quit()
 			return true
 		}
@@ -157,7 +158,7 @@ func (w *Web) ServesGateway() bool { return served.Load() != nil }
 func (w *Web) Wait() error {
 	<-w.quit
 	time.Sleep(200 * time.Millisecond) // the answer to the Quit gets out
-	w.srv.Close()
+	w.Close()
 	if !webReexec.Load() {
 		return nil
 	}
@@ -165,12 +166,40 @@ func (w *Web) Wait() error {
 	if err != nil {
 		return err
 	}
-	// the plugin hosts end, waited for, first: one still running at the
-	// exec is a child nothing waits for after it, <defunct> under this
-	// pid from then on (#3285)
+	// End and reap plugin hosts before replacing this process (#3285).
 	plugin.EndHosts()
 	return update.Reexec(exe, os.Args[1:], append(os.Environ(), webRunKey+"="+w.key))
 }
+
+// Close stops the web page and waits for this process's gateway to save its sessions.
+func (w *Web) Close() {
+	// a gateway draining (a SIGTERM, gateway.Drain) lets the page port's
+	// requests in flight finish too, the /v1 ones an agent sends through it
+	// included, for as long as the gateway gives its own
+	pageDone := make(chan struct{})
+	if gw := served.Load(); gw != nil && gw.Draining() {
+		go func() {
+			defer close(pageDone)
+			ctx, cancel := context.WithTimeout(context.Background(), gw.Grace())
+			defer cancel()
+			if w.srv.Shutdown(ctx) != nil {
+				w.srv.Close()
+			}
+		}()
+	} else {
+		w.srv.Close()
+		close(pageDone)
+	}
+	// The gateway keeps idle Claude sessions as it ends. Wait for that
+	// before returning or replacing this process, or the next turn has
+	// to replay the whole conversation instead of resuming its session.
+	stopServing()
+	<-pageDone
+}
+
+// ServedGateway is the gateway this process serves, nil while another
+// magpie has it.
+func ServedGateway() *gateway.Server { return served.Load() }
 
 // webKeyMin is the shortest MAGPIE_WEB_KEY taken: it is all that stands
 // between the network and the keys behind the page.

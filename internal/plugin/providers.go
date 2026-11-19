@@ -211,6 +211,11 @@ type Provider struct {
 	Importable  bool              `json:"importable,omitempty"`
 	ImportFrom  string            `json:"importFrom,omitempty"`
 	ImportFroms map[string]string `json:"importFroms,omitempty"`
+	// CLI is the vendor CLI the plugin runs through and can install itself
+	// (auth.cli, magpie's own hook): a sign-in on a machine without it,
+	// magpie in a container above all, installs it first (CLIInstalled,
+	// InstallCLI). nil for a plugin that names none.
+	CLI *CLI `json:"cli,omitempty"`
 	// MaxConcurrency is how many requests the plugin says each of its
 	// accounts takes at once (magpie's own field, which OpenCode ignores:
 	// the auth hook's maxConcurrency, else package.json's
@@ -596,7 +601,7 @@ func UseCached(ps []Provider) {
 	provMu.Unlock()
 	// as asked with the plugins as they are now
 	listSeen.Lock()
-	listSeen.stamp, listSeen.set = listStamp(), ps != nil
+	listSeen.stamp, listSeen.set = seenStamp(), ps != nil
 	listSeen.Unlock()
 }
 
@@ -620,6 +625,19 @@ func Listed() ([]Provider, bool) {
 
 // refreshing is Cached's refreshes in the background.
 var refreshing sync.WaitGroup
+
+// ListInBackground sets whether Cached, finding the plugins not asked
+// since this magpie started or since they changed, asks them in the
+// background: true until it is set. The app, serve, web, tray and the TUI
+// do; a command that does its work and ends (magpie version, magpie group
+// <id>) reads what was listed last and asks nothing. Its ask started a
+// second plugin host beside the running gateway's, which the command left
+// running as it exited, its call to a browser-backed plugin's models still
+// pending: that orphan opened the same Chrome profiles as the gateway's
+// host, and Chrome refused them (#7146). It gives what was set before.
+func ListInBackground(on bool) (was bool) { return !noBackgroundList.Swap(!on) }
+
+var noBackgroundList atomic.Bool
 
 // Refreshed waits for Cached's refreshes in the background to end, the
 // host left running: for tests that watch the providers' list on disk.
@@ -692,6 +710,8 @@ func Settle() {
 	// answered with these
 	UseCached(nil)
 	cancelCatalogSyncs()
+	// nor a Bun download, which writes in the test's folder
+	endBunFetches()
 }
 
 // Cached is the plugins' providers as last asked, without starting the
@@ -744,7 +764,7 @@ func Cached() []Provider {
 		// Whether one is already in flight is read and set under one lock,
 		// so two callers asking at once start one refresh, not two.
 		provMu.Lock()
-		start := !provBusy && !provGood && !provTried && !provSettling
+		start := !provBusy && !provGood && !provTried && !provSettling && !noBackgroundList.Load()
 		var ctx context.Context
 		if start {
 			ctx, provCancel = context.WithCancel(context.Background())
@@ -1102,6 +1122,32 @@ func ImportFiles(ctx context.Context, provider string, texts []string) ([]Import
 		return nil, err
 	}
 	return r.Results, nil
+}
+
+// CLI is a vendor CLI a plugin can install: its name, and how a person
+// installs it, told when the plugin's install fails ("" for none said).
+type CLI struct {
+	Name   string `json:"name"`
+	Manual string `json:"manual,omitempty"`
+}
+
+// CLIInstalled asks the plugin whether the CLI its Provider.CLI names is
+// on this machine.
+func CLIInstalled(ctx context.Context, provider string) (bool, error) {
+	var r struct {
+		Installed bool `json:"installed"`
+	}
+	if err := Call(ctx, "cliInstalled", map[string]any{"provider": provider}, &r); err != nil {
+		return false, err
+	}
+	return r.Installed, nil
+}
+
+// InstallCLI has the plugin install the CLI its Provider.CLI names,
+// through the proxy ctx carries; it returns once the plugin says it is
+// there, or why not.
+func InstallCLI(ctx context.Context, provider string) error {
+	return Call(ctx, "installCli", map[string]any{"provider": provider, "proxy": proxyOf(ctx)}, nil)
 }
 
 // SignOut forgets one account of the provider's, every one when account

@@ -367,8 +367,8 @@
     const time = d && !isNaN(d) ? d.toLocaleTimeString(intlLang(), { hour: "2-digit", minute: "2-digit" }) : "";
     if (l.token) return time ? t("GitHub's rate limit for your GitHub token is used up until {time}", { time })
       : t("GitHub's rate limit for your GitHub token is used up for now");
-    return time ? t("GitHub allows 60 requests an hour without a token, used up until {time}. Add a GitHub token in Settings → Network and sharing to raise it to 5,000.", { time })
-      : t("GitHub allows 60 requests an hour without a token, used up for now. Add a GitHub token in Settings → Network and sharing to raise it to 5,000.");
+    return time ? t("GitHub allows 60 requests an hour without a token, used up until {time}. Add a GitHub token in Settings › Network and sharing to raise it to 5,000.", { time })
+      : t("GitHub allows 60 requests an hour without a token, used up for now. Add a GitHub token in Settings › Network and sharing to raise it to 5,000.");
   }
   const checkedAt = () => checked ? new Date(checked.at).toLocaleTimeString(intlLang(), { hour: "2-digit", minute: "2-digit" }) : "";
 
@@ -1032,7 +1032,7 @@
     // the search field keeps its focus: only the body is redrawn while
     // typing, and the GitHub section's field is kept in it
     if (tab === "installed" || tab === "builtin" || !listings) body.replaceChildren();
-    if (tab === "installed") return drawInstalled();
+    if (tab === "installed") return drawInstalled(), window.pmLeftovers?.(body, mine, logo, act, busy);
     if (tab === "builtin") return drawBuiltin();
     if (failedList && !listings) {
       body.append(el("p", "pm-empty", t("Couldn't load the plugins: {error}", { error: failedList })));
@@ -1492,6 +1492,14 @@
     const no = el("button", "text", t("Cancel"));
     no.onclick = () => { editing = null; draw(); };
     bar.append(note);
+    // its declared switches are its provider's, kept in that editor: one
+    // place each, and this one points there
+    const sw = subsOf(name(e.spec)).find((x) => x.signedIn && x.options?.length);
+    if (sw) {
+      const go = el("button", "text quiet pm-opts-switches", t("Its switches are in {name}'s editor", { name: subName(sw) }));
+      go.onclick = () => { editing = null; draw(); openProvider(sw.id); };
+      bar.append(go);
+    }
     if (e.options) {
       const clr = el("button", "text quiet", t("Clear"));
       clr.title = t("Runs it with no options");

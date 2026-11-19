@@ -4,10 +4,11 @@
 // that is only reachable through a proxy hangs until the agent gives up.
 //
 // In order: the proxy set in magpie's settings (or "direct" for none), the
-// usual *_PROXY variables, then the system's proxy (macOS network
-// settings, Windows Internet Options). Loopback is never proxied, nor,
-// unless a provider has a proxy of its own, a host on the user's own
-// network (lan.go).
+// usual *_PROXY variables, the system's proxy (macOS network settings,
+// Windows Internet Options, a Linux desktop's GNOME gsettings or KDE
+// kioslaverc), then the login shell's *_PROXY (shell.go). Loopback is
+// never proxied, nor, unless a provider has a proxy of its own, a host on
+// the user's own network (lan.go).
 package netproxy
 
 import (
@@ -202,6 +203,13 @@ func forChoice(c string) (*url.URL, error) {
 // its transport.
 var HTTP1 func(u *url.URL) bool
 
+// Elsewhere sends a request that Go's own TLS can't carry another way,
+// before a transport of Dispatch's dials it: ok false leaves the request
+// to the transport. internal/provider sets it for OpenCode Zen's free
+// tier, which answers a client that isn't Bun's 429 (zen_bun.go); nil
+// leaves every request to its transport.
+var Elsewhere func(req *http.Request) (res *http.Response, ok bool, err error)
+
 // Dispatch is a RoundTripper sending a request through base, unless its
 // context names a provider's own proxy (With): then through a clone of
 // base kept for that proxy alone. Connections are so reused among the
@@ -248,6 +256,11 @@ type route struct {
 }
 
 func (d *dispatch) RoundTrip(req *http.Request) (*http.Response, error) {
+	if f := Elsewhere; f != nil {
+		if res, ok, err := f(req); ok {
+			return res, err
+		}
+	}
 	if d.moved() {
 		d.CloseIdleConnections()
 	}
@@ -390,7 +403,10 @@ func For(u *url.URL) (*url.URL, error) {
 		return p, err
 	}
 	sys := System()
-	if sys.URL == "" || bypassed(u.Hostname(), sys.Bypass) {
+	if sys.URL == "" {
+		return fromShell(u), nil
+	}
+	if bypassed(u.Hostname(), sys.Bypass) {
 		return nil, nil
 	}
 	return Parse(sys.URL)
@@ -435,10 +451,12 @@ func EnvWith(choice string, env []string) []string {
 			}
 		}
 		sys := System()
-		if sys.URL == "" {
-			return env
-		}
 		p, bypass = sys.URL, sys.Bypass
+		if p == "" {
+			if p, bypass = shellProxy(); p == "" {
+				return env
+			}
+		}
 	default:
 		u, err := Parse(s)
 		if err != nil {
@@ -522,6 +540,9 @@ func Describe() (proxy, source string) {
 	if sys := System(); sys.URL != "" {
 		return sys.URL, "system"
 	}
+	if p := fromShell(u); p != nil {
+		return p.String(), "environment"
+	}
 	return "", "none"
 }
 
@@ -537,6 +558,9 @@ func Redact(raw string) string {
 		return ""
 	}
 	if settings.IsProxyRef(raw) {
+		if a := sshShown(raw); a != "" {
+			return a
+		}
 		// a saved proxy shown as its address, with no login
 		u.User = nil
 		return u.String()
@@ -550,6 +574,18 @@ func Redact(raw string) string {
 		address = strings.TrimPrefix(address, "http://")
 	}
 	return address
+}
+
+// sshShown is how a saved SSH proxy (a reference) is shown: its server's
+// address, not the tunnel's on loopback; "" for any other proxy.
+func sshShown(ref string) string {
+	id := settings.ProxyID(ref)
+	for _, p := range settings.Shared().Proxies {
+		if p.ID == id && p.IsSSH() {
+			return strings.TrimSpace(p.URL)
+		}
+	}
+	return ""
 }
 
 // fromEnv is the proxy the environment names for u: HTTPS_PROXY or

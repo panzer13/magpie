@@ -129,7 +129,10 @@ func (a *Agent) Apply(key, v string) error {
 			record(a.ID, k, now[k])
 		}
 	}
-	record(a.ID, f.Key, f.Get())
+	// the user's own setting isn't magpie's to put back or take out
+	if !f.Own {
+		record(a.ID, f.Key, f.Get())
+	}
 	// magpie picked in by the user's own hand (magpie model, a pick in
 	// the CLI) connects it again
 	if a.Wired() {
@@ -405,7 +408,8 @@ func (m *valueMemo) in(a *Agent, f Field, v string, vals map[string]string, opts
 // magpieValueIn is magpieValue reading a field's options from opts, made
 // for the same vals; nil reads them anew.
 func magpieValueIn(a *Agent, f Field, v string, vals map[string]string, opts fieldOptions) bool {
-	if v == "" {
+	// the user's own setting (a permission mode) is never one of magpie's
+	if v == "" || f.Own {
 		return false
 	}
 	v, _, one := a.split(v)
@@ -618,7 +622,8 @@ func (a *Agent) Pick(key, v string) error {
 		}
 		return a.Apply(key, value)
 	}
-	if f := a.Field(key); f != nil && !a.Wired() {
+	// the user's own setting never connects the agent to magpie
+	if f := a.Field(key); f != nil && !f.Own && !a.Wired() {
 		vals := a.Values()
 		vals[key] = v
 		if v == magpieID || magpieValue(a, *f, v, vals) {
@@ -656,7 +661,7 @@ func (e *NoModelsError) Error() string {
 type AllHiddenError struct{ Agent string }
 
 func (e *AllHiddenError) Error() string {
-	return "None of magpie's models is left in " + e.Agent + "'s model list: pick one under Model list → Pick on the Agents page, then connect " + e.Agent
+	return "None of magpie's models is left in " + e.Agent + "'s model list: pick one under Model list › Pick on the Agents page, then connect " + e.Agent
 }
 
 func (a *Agent) Connect() error {
@@ -680,6 +685,8 @@ func (a *Agent) Connect() error {
 //     own models in its list (the newest, for Claude Code), through magpie
 //   - "first": magpie has none of the model it is on: the first on the
 //     account it is signed in to, else a subscription's, else the first
+//   - "remote": the models a Remote magpie's same agent is on
+//     (remote_picks.go)
 //
 // Field and Value are the field set and what it was set to, where Connect
 // picked one model ("" for kept, again and joined).
@@ -756,6 +763,10 @@ func (a *Agent) connect() (Connection, error) {
 		if ok, err := a.Join(); ok || err != nil {
 			return Connection{How: "joined"}, err
 		}
+	}
+	// the models the Remote magpie's same agent is on (remote_picks.go)
+	if c, ok, err := a.connectRemote(); ok || err != nil {
+		return c, err
 	}
 	// the field magpie is picked in: the one listing magpie's models (for
 	// Gemini CLI its model, its first field being how it signs in), else one
@@ -934,6 +945,9 @@ func (a *Agent) Disconnect() (err error) {
 		}
 	}
 	for _, f := range a.Fields {
+		if f.Own {
+			continue
+		}
 		vals := a.Values()
 		v := vals[f.Key]
 		// set by magpie: as it set it, or its group by the model's name
@@ -960,6 +974,10 @@ func (a *Agent) Disconnect() (err error) {
 		}
 	}
 	for _, f := range a.Fields {
+		// the user's own setting is as they left it, not as it was at connect
+		if f.Own {
+			continue
+		}
 		if w := was[f.Key]; w != "" && after[f.Key] == "" && w != magpieID && !magpieValue(a, f, w, was) {
 			if err := f.Set(w); err != nil {
 				return fmt.Errorf("%s: %w", f.Label, err)
