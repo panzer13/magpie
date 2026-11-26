@@ -85,6 +85,14 @@ export const FakePlugin = async ({ client }) => ({
         "fake-gemini": { name: "Fake Gemini", provider: { npm: "@ai-sdk/google" }, reasoning: true, modalities: { input: ["text"], output: ["text"] }, limit: { context: 3000, output: 300 } },
       },
     }
+    // $FAKE_SPLIT: a provider declared as WorkBuddy's plugin declares it,
+    // its chat at <root>/v2 and its Claude model on Messages at <root>/v1,
+    // the loader giving no base (each model's own URL says where it goes)
+    if (process.env.FAKE_SPLIT) {
+      const root = String(process.env.FAKE_BASE).replace(/\/v1$/, "")
+      cfg.provider[ID].api = root + "/v2"
+      cfg.provider[ID].models["fake-claude"].provider.api = root + "/v1"
+    }
     // $FAKE_KIRO: a Claude model named as Kiro's plugin names it, on
     // Anthropic's Messages API
     if (process.env.FAKE_KIRO) cfg.provider[ID].models["claude-opus-5.5"] = { name: "Claude Opus 5.5", provider: { npm: "@ai-sdk/anthropic" }, reasoning: true, modalities: { input: ["text", "image"], output: ["text"] }, limit: { context: 200000, output: 32000 } }
@@ -244,7 +252,7 @@ export const FakePlugin = async ({ client }) => ({
       if (process.env.FAKE_LOAD_WAIT) await new Promise((r) => setTimeout(r, Number(process.env.FAKE_LOAD_WAIT)))
       return {
       apiKey: "dummy",
-      baseURL: process.env.FAKE_BASE,
+      baseURL: process.env.FAKE_SPLIT ? "" : process.env.FAKE_BASE,
       async fetch(url, init) {
         let a = await getAuth()
         // "r-revoked": the vendor turned the refresh away, said as Zed's says it
@@ -264,7 +272,7 @@ export const FakePlugin = async ({ client }) => ({
         // where magpie said the agent works, as the plugin read it; its own
         // headers go on too, as a plugin that sends on what it got sends
         // them, for the host to take off
-        for (const k of ["x-magpie-work-dir", "x-magpie-work-git", "x-magpie-fallback", "x-magpie-session", "x-magpie-subagent", "x-magpie-effort"]) if (h.has(k)) h.set("x-saw-" + k.slice(9), h.get(k))
+        for (const k of ["x-magpie-work-dir", "x-magpie-work-git", "x-magpie-fallback", "x-magpie-session", "x-magpie-subagent", "x-magpie-effort", "x-magpie-caller-agent", "x-magpie-caller-name", "x-magpie-caller-via"]) if (h.has(k)) h.set("x-saw-" + k.slice(9), h.get(k))
         // $FAKE_QUEUE: that model is queued at the vendor, as Qoder's free
         // models are: waited out (here until magpie gives up) unless magpie
         // said it needn't be, then said at once with the queue's 503
@@ -495,5 +503,8 @@ export const FakePlugin = async ({ client }) => ({
   },
   "chat.headers": async (input, output) => {
     if (input.model.providerID === ID) output.headers["x-plugin-model"] = input.model.id
+    // who asked, as magpie told the hook (input.caller), beside OpenCode's
+    // own agent
+    if (input.caller) output.headers["x-saw-hook-caller"] = encodeURIComponent(JSON.stringify({ agent: input.agent, caller: input.caller }))
   },
 })

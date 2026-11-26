@@ -64,8 +64,13 @@ const WaitHeader = "X-Magpie-Wait"
 
 // SessionToPluginHeader and SubagentToPluginHeader tell a plugin's fetch
 // the session the agent named (sessionOf: Claude Code's
-// x-claude-code-session-id and the rest) and the Claude Code subagent the
-// request is of (x-claude-code-agent-id). The agent's own headers never
+// x-claude-code-session-id and the rest; for an OpenCode 1 subagent that
+// names no separate root session, its x-opencode-parent-session-id unless
+// the caller set X-Magpie-Session) and the subagent the request is of:
+// Claude Code's x-claude-code-agent-id, Codex's spawn thread id
+// (collab_spawn / thread_spawn / agent_job), or OpenCode's
+// x-opencode-session-id when x-opencode-parent-session-id is set. The
+// agent's own headers never
 // reach a plugin, so a plugin that keeps state per conversation (Devin's
 // cache keepalive) had only the request's text to go by, and Claude Code
 // Auto's permission check, whose history grows in its one merged user
@@ -76,6 +81,23 @@ const WaitHeader = "X-Magpie-Wait"
 const (
 	SessionToPluginHeader  = "X-Magpie-Session"
 	SubagentToPluginHeader = "X-Magpie-Subagent"
+)
+
+// CallerAgentHeader, CallerNameHeader and CallerViaHeader tell a plugin's
+// fetch the agent the request came from, as the gateway records it: its
+// id (claude), the name people know it by (Claude Code), and, for a
+// request another magpie passed on (a Remote magpie provider there), the
+// computers it came through, the agent's first, comma-separated. Each
+// value, and each computer, is percent-encoded UTF-8 (decodeURIComponent
+// reads it). A request from this computer has no via. A plugin on the
+// receiving magpie had only the request's text to go by, as the original
+// agent stayed in the gateway (@febsincos on X). The plugin host gives
+// them to chat.headers as input.caller too, and takes them off whatever
+// the plugin sends on, as it does the ones above.
+const (
+	CallerAgentHeader = "X-Magpie-Caller-Agent"
+	CallerNameHeader  = "X-Magpie-Caller-Name"
+	CallerViaHeader   = "X-Magpie-Caller-Via"
 )
 
 // warmPlugin starts p's plugin host and runs its account's loader, which
@@ -763,7 +785,7 @@ func pluginFetch(pp plugin.Provider, account string, req *http.Request) (*http.R
 		}
 	}
 	if !ok {
-		m = plugin.Model{ID: model, NPM: pp.NPM}
+		m = unlistedModel(pp, model, rest)
 	}
 	api := modelAPIID(m)
 	if api != model && !codeAssist {
@@ -813,6 +835,43 @@ func pluginFetch(pp plugin.Provider, account string, req *http.Request) (*http.R
 		notePluginSignIn(pp, account, resp)
 	}
 	return resp, err
+}
+
+// unlistedModel is how pp's request at rest (magpie's path under the
+// plugin's base) is sent for a model the plugin doesn't list: a test model
+// the user typed in. It takes the provider's own AI SDK package, as
+// OpenCode does for a model its config doesn't declare; but a request on
+// an API that package doesn't speak goes where the plugin sends its own
+// models of that API. WorkBuddy's plugin declares its chat at <endpoint>/v2
+// for the provider and its Claude models on Messages at <endpoint>/v1, with
+// no base of the loader's (a provider-wide one would put /messages under
+// /v2): a model off its list, asked on Anthropic's Messages API (its API
+// set to Anthropic in magpie), went to <endpoint>/v2/messages, which
+// WorkBuddy answers "404 Route Not Found" (Anotiaww on X). It goes to
+// <endpoint>/v1/messages now, the built-in Claude models' route.
+func unlistedModel(pp plugin.Provider, model, rest string) plugin.Model {
+	m := plugin.Model{ID: model, NPM: pp.NPM}
+	var want Protocol
+	switch {
+	case strings.HasPrefix(rest, "/v1/messages"):
+		want = Anthropic
+	case strings.HasPrefix(rest, "/v1/chat/completions"):
+		want = Chat
+	case strings.HasPrefix(rest, "/v1/responses"):
+		want = Responses
+	default:
+		return m
+	}
+	if pluginProtocol(pp.ID, m) == want {
+		return m
+	}
+	for _, o := range pp.Models {
+		if pluginProtocol(pp.ID, o) == want {
+			m.NPM, m.URL = o.NPM, o.URL
+			return m
+		}
+	}
+	return m
 }
 
 // pluginRequestBase is the base URL a plugin provider's request for m goes

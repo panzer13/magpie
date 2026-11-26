@@ -332,7 +332,7 @@
 .rt-gsec > .row-head:first-child .rt-gback { flex: none; margin-right: 8px; white-space: nowrap; }
 body.side-nav #view-groups:not(.rt-gfrom) .rt-gback { display: none; }
 /* the settings for every group, a card under the list */
-.rt-gset > :is(.rt-gfound, .rt-gnames, .rt-gdef) { padding: 12px 14px; }
+.rt-gset > :is(.rt-gfound, .rt-gnames, .rt-gdef, .rt-gone) { padding: 12px 14px; }
 .rt-gset > :is(.rt-gnames, .rt-gdef) { border-top: 1px solid var(--line-2); }
 /* an email, hidden: stand-in letters of its shape, softly blurred —
    coming in out of focus when asked for */
@@ -667,6 +667,16 @@ button.rt-session { cursor: pointer; }
    of logos in, spilling it over the card's left edge onto the name (ARNO
    on Discord) */
 .rt-group .rt-ghandle.ag-handle { position: relative; align-items: center; justify-content: center; width: auto; min-width: 24px; height: 24px; padding: 0 3px; }
+/* every row's logos in one cell as wide as the widest stack (three discs
+   and a "+N", 68px), from its left edge, so each name and line under it
+   starts at one x whatever the row's logos; at the top of the row, the
+   discs' top on the name's letters, not centred on a row of four or five
+   lines (the owner, 11-22: 这个排版布局是正确的吗？) */
+.rt-group > .ics { align-self: flex-start; align-items: flex-start; width: 68px; justify-content: flex-start; margin-top: 4px; }
+.rt-group > .rt-ghandle.ag-handle { width: 74px; padding-top: 2px; align-items: flex-start; justify-content: flex-start; margin-top: 2px; }
+/* a group magpie found has no switch: its tags and Edit keep the place
+   they have in a row with one (the switch's 32px and the gap before it) */
+.rt-group > button.text:last-child { margin-right: 44px; }
 .rt-group .rt-ghandle::before { content: ""; position: absolute; left: -7px; top: 50%; width: 5px; height: 11px; margin-top: -5.5px; background: radial-gradient(circle, var(--muted) .9px, transparent 1.2px) 0 0 / 3.5px 3.75px; opacity: 0; transition: opacity .15s; }
 .rt-group:is(:hover, .dragging) .rt-ghandle::before, .rt-group .rt-ghandle.open::before { opacity: 1; }
 /* apart: Safari before 15.4 drops a whole selector list with :focus-visible in it */
@@ -740,10 +750,10 @@ button.rt-session { cursor: pointer; }
 .rt-goffbox { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 12px 14px; }
 .rt-goffwhy { flex: 1 1 260px; min-width: 0; font-size: 12px; line-height: 1.5; color: var(--fg-2); }
 .rt-goffon { flex: none; }
-.rt-gfound, .rt-gnames, .rt-gdef { display: flex; align-items: center; gap: 12px; padding: 2px 4px 4px; }
-.rt-gfound .txt, .rt-gnames .txt, .rt-gdef .txt { flex: 1; min-width: 0; display: grid; gap: 2px; }
-.rt-gfound b, .rt-gnames b, .rt-gdef b { font-size: 12.5px; font-weight: 600; }
-.rt-gfound small, .rt-gnames small, .rt-gdef small { font-size: 11.5px; line-height: 1.45; color: var(--muted); }
+.rt-gfound, .rt-gnames, .rt-gdef, .rt-gone { display: flex; align-items: center; gap: 12px; padding: 2px 4px 4px; }
+.rt-gfound .txt, .rt-gnames .txt, .rt-gdef .txt, .rt-gone .txt { flex: 1; min-width: 0; display: grid; gap: 2px; }
+.rt-gfound b, .rt-gnames b, .rt-gdef b, .rt-gone b { font-size: 12.5px; font-weight: 600; }
+.rt-gfound small, .rt-gnames small, .rt-gdef small, .rt-gone small { font-size: 11.5px; line-height: 1.45; color: var(--muted); }
 /* the names setting's three choices go under its words when it is narrow */
 .rt-gnames, .rt-gdef { flex-wrap: wrap; }
 /* the providers kept out of found groups: a text button under the
@@ -817,6 +827,7 @@ body.window .rt-gedit > .bar { --vfoot: 8px; }
   }
   body.web .rt-group .tags { justify-content: flex-start; max-width: none; grid-column: 2 / -1; grid-row: 2; }
   body.web .rt-group > .text { grid-column: 3; grid-row: 1; }
+  body.web .rt-group > button.text:last-child { margin-right: 0; }
   body.web .rt-group .nm { flex-wrap: wrap; }
   body.web .rt-group .mem { white-space: normal; overflow-wrap: anywhere; }
   /* wrapped, a member moves to the next line whole, cut short only when
@@ -860,6 +871,11 @@ body.window .rt-gedit > .bar { --vfoot: 8px; }
    the chips go on a line of their own, right-aligned, rather than past
    the edge; none of them is ever cut */
 .rt-gedit .fallback, .rt-gedit .fallback:not(.rt-rules) .fbl { grid-template-columns: minmax(0, 1fr); }
+/* the rows stack in a column, not a grid: WebKit (the macOS app) sized a
+   grid's row to its member's first line only, so a row whose chips wrapped
+   onto a second line (an account picked, liaobode96 on X) drew that line
+   over the next row, and the last one's under the list */
+.rt-gedit .fallback .fbl:not(:empty) { display: flex; flex-direction: column; }
 /* in :where, so a phone's own row (body.web, above) still wins */
 :where(.rt-gedit .fallback:not(.rt-rules)) .fbrow { flex-wrap: wrap; justify-content: flex-end; row-gap: 2px; }
 :where(.rt-gedit .fallback:not(.rt-rules)) .fbrow .n { flex: 1 1 8em; }
@@ -901,6 +917,9 @@ body.window .rt-gedit > .bar { --vfoot: 8px; }
 /* a group's account choice (Group.Accounts): a long account name ellipsizes */
 .rt-gedit .fbrow .rt-gacct { flex: 0 1 auto; min-width: 0; }
 .rt-gedit .fbrow .rt-gacct > span { overflow: hidden; text-overflow: ellipsis; }
+/* a member's own account: a long address ellipsizes rather than pushing
+   the row past the editor's edge */
+.rt-gedit .fbrow .rt-macct { flex: 0 1 auto; min-width: 0; }
 .rt-gedit > .rt-gacc[hidden] { display: none; }
 /* a group bound to gateway keys (Group.Keys): a long key name ellipsizes */
 .rt-gedit > .rt-gkeys[hidden] { display: none; }
@@ -994,6 +1013,14 @@ body.window .rt-gedit > .bar { --vfoot: 8px; }
 .rt-info[hidden] { display: none; }
 .rt-gadds { align-items: center; }
 .rt-pickrow { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+/* the classifier's own instructions: a few lines, the ⓘ at the top beside them */
+.rt-cls-promptrow { flex-wrap: nowrap; align-items: flex-start; }
+.rt-cls-prompt, .editor .rt-cls-prompt {
+  flex: 1 1 auto; min-width: 0; box-sizing: border-box; min-height: 62px; margin: 0; padding: 6px 9px; border-radius: 7px;
+  border: 1px solid var(--line); background: var(--card); color: var(--fg); font: inherit; line-height: 1.45;
+  resize: vertical; outline: none; overflow-wrap: anywhere;
+}
+.rt-cls-prompt:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent); }
 .rt-cond {
   display: inline-flex; align-items: center; gap: 5px; height: 26px; padding: 0 10px; border-radius: 999px;
   border: 1px dashed var(--line); background: transparent; color: var(--muted);
